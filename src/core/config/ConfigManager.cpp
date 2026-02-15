@@ -9,6 +9,7 @@ static const QString KEY_ADMIN = QStringLiteral("admin");
 static const QString KEY_RDP_GFX = QStringLiteral("rdp/gfx_pipeline");
 static const QString KEY_RDP_H264 = QStringLiteral("rdp/h264");
 static const QString KEY_RDP_RFX = QStringLiteral("rdp/remotefx");
+static const QString KEY_RDP_FONT_SMOOTHING = QStringLiteral("rdp/font_smoothing");
 
 ConfigManager::ConfigManager() = default;
 
@@ -120,4 +121,17 @@ void ConfigManager::setRdpRemoteFx(bool enabled)
 {
     if (m_settings)
         m_settings->setValue(KEY_RDP_RFX, enabled);
+}
+
+bool ConfigManager::rdpFontSmoothing() const
+{
+    if (m_settings)
+        return m_settings->value(KEY_RDP_FONT_SMOOTHING, true).toBool();
+    return true;
+}
+
+void ConfigManager::setRdpFontSmoothing(bool enabled)
+{
+    if (m_settings)
+        m_settings->setValue(KEY_RDP_FONT_SMOOTHING, enabled);
 }

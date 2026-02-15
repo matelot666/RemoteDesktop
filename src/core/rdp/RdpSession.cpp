@@ -169,8 +169,10 @@ void RdpSession::start()
     freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, TRUE);
 
     // ── Performance: visual experience ──
-    freerdp_settings_set_bool(settings, FreeRDP_AllowFontSmoothing, TRUE);
-    freerdp_settings_set_bool(settings, FreeRDP_AllowDesktopComposition, TRUE);
+    freerdp_settings_set_bool(settings, FreeRDP_AllowFontSmoothing,
+                              m_rdpOptions.fontSmoothing ? TRUE : FALSE);
+    freerdp_settings_set_bool(settings, FreeRDP_AllowDesktopComposition,
+                              m_rdpOptions.fontSmoothing ? TRUE : FALSE);
     freerdp_settings_set_uint32(settings, FreeRDP_PerformanceFlags, 0); // All visual features on
     freerdp_settings_set_uint32(settings, FreeRDP_LargePointerFlag, 1);
 

@@ -185,7 +185,20 @@ int main(int argc, char *argv[])
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
 
+    // Use exact DPI scale factor (e.g. 1.25x, 1.5x) instead of rounding to
+    // nearest integer.  Prevents blurry / aliased glyphs on Windows displays
+    // running at fractional scaling (125%, 150%).
+    QApplication::setHighDpiScaleFactorRoundingPolicy(
+        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+
     QApplication app(argc, argv);
+
+    // Ensure antialiased font rendering on all platforms
+    {
+        QFont f = app.font();
+        f.setStyleStrategy(QFont::PreferAntialias);
+        app.setFont(f);
+    }
 
 #ifdef _WIN32
     // Log qDebug/qWarning to a file since Windows GUI apps have no console

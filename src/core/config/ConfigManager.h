@@ -33,6 +33,9 @@ public:
     bool rdpRemoteFx() const;
     void setRdpRemoteFx(bool enabled);
 
+    bool rdpFontSmoothing() const;
+    void setRdpFontSmoothing(bool enabled);
+
 private:
     QSettings *m_settings = nullptr;
     QString m_configDir;

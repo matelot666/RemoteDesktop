@@ -161,6 +161,7 @@ void RdpSessionWidget::connectSession()
         opts.gfxPipeline = cfg->rdpGfxPipeline();
         opts.h264 = cfg->rdpH264();
         opts.remoteFx = cfg->rdpRemoteFx();
+        opts.fontSmoothing = cfg->rdpFontSmoothing();
         m_session->setRdpOptions(opts);
         m_workerThread->start();
     });

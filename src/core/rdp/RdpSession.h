@@ -35,6 +35,7 @@ struct RdpOptions {
     bool gfxPipeline = false;
     bool h264 = false;
     bool remoteFx = true;
+    bool fontSmoothing = true;
 };
 
 class RdpSession : public QObject {

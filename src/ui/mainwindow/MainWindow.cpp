@@ -200,6 +200,16 @@ void MainWindow::setupMenuBar()
         if (!gfxOn)
             actH264->setChecked(false);
     });
+
+    rdpMenu->addSeparator();
+
+    auto *actFontSmoothing = rdpMenu->addAction(QStringLiteral("Font Smoothing"));
+    actFontSmoothing->setCheckable(true);
+    actFontSmoothing->setChecked(cfg->rdpFontSmoothing());
+    connect(actFontSmoothing, &QAction::toggled, this, [cfg](bool checked) {
+        cfg->setRdpFontSmoothing(checked);
+        cfg->save();
+    });
 }
 
 void MainWindow::setupShortcuts()
