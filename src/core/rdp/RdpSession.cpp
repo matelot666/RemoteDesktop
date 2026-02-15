@@ -150,10 +150,15 @@ void RdpSession::start()
     // ── GFX pipeline (off by default — requires RDPGFX surface rendering) ──
     if (m_rdpOptions.gfxPipeline) {
         freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
-        freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, TRUE);
+        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, TRUE);
+        freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, TRUE);
+        freerdp_settings_set_bool(settings, FreeRDP_GfxSendQoeAck, TRUE);
         if (m_rdpOptions.h264) {
             freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, TRUE);
             freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
+        } else {
+            freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
+            freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE);
         }
     }
 

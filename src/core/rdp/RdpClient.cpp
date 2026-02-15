@@ -3,10 +3,13 @@
 #include <freerdp/codec/color.h>
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/cliprdr.h>
+#include <freerdp/channels/rdpgfx.h>
 #include <freerdp/client/cliprdr.h>
+#include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/cmdline.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/event.h>
+#include <freerdp/gdi/gfx.h>
 #include <winpr/crt.h>
 #include <winpr/wtsapi.h>
 
@@ -19,27 +22,68 @@
 
 extern "C" {
 
+// Custom addin provider: resolves DVC plugins from the compiled-in static
+// entry table.  FreeRDP's default loader (freerdp_load_channel_addin_entry)
+// tries dlopen first, which fails for our static build.  By registering this
+// provider we intercept the lookup and return the static entry directly.
+static PVIRTUALCHANNELENTRY rdp_static_addin_provider(LPCSTR pszName,
+                                                       LPCSTR pszSubsystem,
+                                                       LPCSTR pszType,
+                                                       DWORD dwFlags)
+{
+    // First check the normal static addin table (handles SVCs)
+    auto entry = freerdp_channels_load_static_addin_entry(pszName, pszSubsystem,
+                                                           pszType, dwFlags);
+    if (entry)
+        return entry;
+
+    // For dynamic channels, also check the DVCPluginEntry static table
+    if (pszName && (dwFlags & FREERDP_ADDIN_CHANNEL_DYNAMIC)) {
+        auto dvcEntry = freerdp_channels_client_find_static_entry("DVCPluginEntry", pszName);
+        if (dvcEntry)
+            return reinterpret_cast<PVIRTUALCHANNELENTRY>(dvcEntry);
+    }
+
+    return nullptr;
+}
+
 BOOL rdp_load_channels(freerdp *instance)
 {
     auto *ctx = reinterpret_cast<RdpCustomContext *>(instance->context);
-    rdpSettings *settings = instance->context->settings;
-
     if (!ctx || !ctx->session)
         return TRUE;
 
-    BOOL clipboardEnabled = freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard);
-    if (clipboardEnabled) {
-        // Look up the cliprdr entry point from the static channel table
-        // Args: find_static_entry(entry_type, channel_name)
-        auto entryFn = reinterpret_cast<PVIRTUALCHANNELENTRYEX>(
-            freerdp_channels_client_find_static_entry("VirtualChannelEntryEx", "cliprdr"));
+    rdpSettings *settings = instance->context->settings;
+    BOOL clipEnabled = freerdp_settings_get_bool(settings, FreeRDP_RedirectClipboard);
+    BOOL gfxEnabled = freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline);
 
-        if (entryFn) {
-            freerdp_channels_client_load_ex(
-                instance->context->channels, settings, entryFn, settings);
+    // Register our custom addin provider so that drdynvc's internal plugin
+    // loader can find DVC plugins (like rdpgfx) from the static entry table
+    // instead of failing with dlopen.
+    freerdp_register_addin_provider(rdp_static_addin_provider, 0);
+
+    // Channels are statically linked into libfreerdp-client — look them up
+    // from the compiled-in entry table (NOT dlopen, which would fail).
+    if (clipEnabled) {
+        auto fn = reinterpret_cast<PVIRTUALCHANNELENTRYEX>(
+            freerdp_channels_client_find_static_entry("VirtualChannelEntryEx", "cliprdr"));
+        if (fn)
+            freerdp_channels_client_load_ex(instance->context->channels, settings, fn, settings);
+    }
+
+    if (gfxEnabled) {
+        // Load DRDYNVC static channel (transport for dynamic channels)
+        auto fn = reinterpret_cast<PVIRTUALCHANNELENTRYEX>(
+            freerdp_channels_client_find_static_entry("VirtualChannelEntryEx", "drdynvc"));
+        if (fn) {
+            freerdp_channels_client_load_ex(instance->context->channels, settings, fn, settings);
         } else {
-            qWarning() << "cliprdr entry point not found in static channel table";
+            return FALSE;
         }
+
+        // Register RDPGFX as a dynamic channel plugin within DRDYNVC
+        const char *gfxParams[] = { "rdpgfx" };
+        freerdp_client_add_dynamic_channel(settings, 1, gfxParams);
     }
 
     return TRUE;
@@ -55,21 +99,45 @@ BOOL rdp_pre_connect(freerdp *instance)
     return TRUE;
 }
 
+// Called by FreeRDP (including gdi_ResetGraphics in the GFX pipeline) when
+// the desktop dimensions change.  Resizes the GDI primary buffer and
+// updates our RdpSession with the new buffer pointer.
+BOOL rdp_desktop_resize(rdpContext *context)
+{
+    auto *ctx = reinterpret_cast<RdpCustomContext *>(context);
+    rdpGdi *gdi = context->gdi;
+    rdpSettings *settings = context->settings;
+
+    UINT32 width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+    UINT32 height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+
+    if (!gdi_resize(gdi, width, height))
+        return FALSE;
+
+    if (ctx && ctx->session) {
+        ctx->session->onPostConnect(gdi->width, gdi->height,
+                                    gdi->primary_buffer, gdi->stride);
+    }
+
+    return TRUE;
+}
+
 BOOL rdp_post_connect(freerdp *instance)
 {
     auto *ctx = reinterpret_cast<RdpCustomContext *>(instance->context);
 
-    if (!gdi_init(instance, PIXEL_FORMAT_BGRA32)) {
+    if (!gdi_init(instance, PIXEL_FORMAT_BGRA32))
         return FALSE;
-    }
 
     rdpGdi *gdi = instance->context->gdi;
+
     ctx->session->onPostConnect(gdi->width, gdi->height,
                                 gdi->primary_buffer, gdi->stride);
 
-    // Set EndPaint callback
+    // Set update callbacks
     rdpUpdate *update = instance->context->update;
     update->EndPaint = rdp_end_paint;
+    update->DesktopResize = rdp_desktop_resize;
 
     return TRUE;
 }
@@ -392,6 +460,11 @@ void rdp_on_channel_connected(void *context, const ChannelConnectedEventArgs *e)
         cliprdr->ServerFileContentsRequest = rdp_cliprdr_server_file_contents_request;
         ctx->session->setCliprdrContext(cliprdr);
     }
+    else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && e->pInterface) {
+        auto *gfx = static_cast<RdpgfxClientContext *>(e->pInterface);
+        rdpGdi *gdi = ctx->context.gdi;
+        gdi_graphics_pipeline_init(gdi, gfx);
+    }
 }
 
 void rdp_on_channel_disconnected(void *context, const ChannelDisconnectedEventArgs *e)
@@ -400,8 +473,14 @@ void rdp_on_channel_disconnected(void *context, const ChannelDisconnectedEventAr
     if (!ctx || !ctx->session || !e)
         return;
 
-    if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
+    if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
         ctx->session->setCliprdrContext(nullptr);
+    }
+    else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && e->pInterface) {
+        auto *gfx = static_cast<RdpgfxClientContext *>(e->pInterface);
+        rdpGdi *gdi = ctx->context.gdi;
+        gdi_graphics_pipeline_uninit(gdi, gfx);
+    }
 }
 
 } // extern "C"

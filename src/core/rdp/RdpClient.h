@@ -20,6 +20,7 @@ extern "C" {
     BOOL rdp_post_connect(freerdp *instance);
     void rdp_post_disconnect(freerdp *instance);
     BOOL rdp_end_paint(rdpContext *context);
+    BOOL rdp_desktop_resize(rdpContext *context);
     BOOL rdp_authenticate(freerdp *instance, char **username, char **password, char **domain);
     BOOL rdp_authenticate_ex(freerdp *instance, char **username, char **password,
                              char **domain, rdp_auth_reason reason);

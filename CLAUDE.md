@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-cp -R build/RemoteDesktop.app /Applications/RemoteDesktop.app   # deploy
+rm -rf /Applications/RemoteDesktop.app && cp -R build/RemoteDesktop.app /Applications/RemoteDesktop.app  # deploy
 ./build/RemoteDesktop.app/Contents/MacOS/RemoteDesktop           # run
 ```
 
@@ -87,7 +87,8 @@ When connecting: `main.cpp` reads `entry.credentialId` (overlaid from user DB) �
 - `Application.h` uses `std::unique_ptr` with forward-declared types — needs explicit destructor in .cpp
 - FreeRDP `freerdp` is a typedef, not a struct — don't use `struct freerdp*`
 - PIXEL_FORMAT_BGRA32 in FreeRDP maps to QImage::Format_ARGB32 on little-endian
-- FreeRDP 3.x channel loading: use `freerdp_channels_load_plugin(ctx->channels, settings, "cliprdr", nullptr)` in the `LoadChannels` callback. Do NOT use `freerdp_channels_client_load_ex()` with `cliprdr_VirtualChannelEntryEx` — that symbol is internal to the DLL and not exported on Windows shared builds. PubSub `ChannelConnected` events deliver the channel interface.
+- FreeRDP 3.x channel loading (static builds): `freerdp_load_channel_addin_entry` without a registered provider goes straight to dlopen, which fails. Register a custom provider via `freerdp_register_addin_provider()` that delegates to `freerdp_channels_load_static_addin_entry()` (for SVCs) and `freerdp_channels_client_find_static_entry("DVCPluginEntry", name)` (for DVCs like rdpgfx). Load SVCs (cliprdr, drdynvc) via `freerdp_channels_client_find_static_entry("VirtualChannelEntryEx", name)` + `freerdp_channels_client_load_ex()`. Register DVCs via `freerdp_client_add_dynamic_channel()`. PubSub `ChannelConnected` events deliver the channel interface.
+- FreeRDP GFX pipeline requires `update->DesktopResize` callback set in `rdp_post_connect`; `gdi_ResetGraphics` asserts it's non-NULL. The handler must call `gdi_resize()` then update `RdpSession` buffer pointers.
 - Windows SDK `rpcndr.h` defines `small` as a macro — collides with libvterm's `VTermScreenCellAttrs::small`. Use `#pragma push_macro("small")/#undef small` around `#include <vterm.h>`.
 - RDP keyboard: macOS uses `nativeVirtualKey()` (Carbon keycodes) + lookup table; Windows uses `nativeScanCode()` directly (hardware scan codes = RDP scan codes). Guard with `#ifdef Q_OS_MACOS`.
 - Qt `Qt::META` = Cmd on macOS but Win key on Windows. Use `Qt::CTRL` for cross-platform shortcuts or `QKeySequence::StandardKey` enums.
