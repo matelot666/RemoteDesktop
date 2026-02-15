@@ -1,0 +1,14 @@
+<RCC>
+    <qresource prefix="/">
+        <file>icons/folder.svg</file>
+        <file>icons/rdp-disconnected.svg</file>
+        <file>icons/rdp-connecting.svg</file>
+        <file>icons/rdp-connected.svg</file>
+        <file>icons/rdp-error.svg</file>
+        <file>icons/ssh-disconnected.svg</file>
+        <file>icons/ssh-connecting.svg</file>
+        <file>icons/ssh-connected.svg</file>
+        <file>icons/ssh-error.svg</file>
+        <file>icons/appicon/appicon.png</file>
+    </qresource>
+</RCC>

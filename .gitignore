@@ -1,0 +1,26 @@
+# Build
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Qt
+*.pro.user
+moc_*
+ui_*
+qrc_*
+
+# Compiled
+*.o
+*.a
+*.dylib
+*.so
+
+# App data
+.remotedesktop/
