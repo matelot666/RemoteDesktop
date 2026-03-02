@@ -10,6 +10,7 @@ static const QString KEY_RDP_GFX = QStringLiteral("rdp/gfx_pipeline");
 static const QString KEY_RDP_H264 = QStringLiteral("rdp/h264");
 static const QString KEY_RDP_RFX = QStringLiteral("rdp/remotefx");
 static const QString KEY_RDP_FONT_SMOOTHING = QStringLiteral("rdp/font_smoothing");
+static const QString KEY_RDP_VERBOSE_LOG = QStringLiteral("rdp/verbose_log");
 
 ConfigManager::ConfigManager() = default;
 
@@ -134,4 +135,17 @@ void ConfigManager::setRdpFontSmoothing(bool enabled)
 {
     if (m_settings)
         m_settings->setValue(KEY_RDP_FONT_SMOOTHING, enabled);
+}
+
+bool ConfigManager::rdpVerboseLog() const
+{
+    if (m_settings)
+        return m_settings->value(KEY_RDP_VERBOSE_LOG, false).toBool();
+    return false;
+}
+
+void ConfigManager::setRdpVerboseLog(bool enabled)
+{
+    if (m_settings)
+        m_settings->setValue(KEY_RDP_VERBOSE_LOG, enabled);
 }

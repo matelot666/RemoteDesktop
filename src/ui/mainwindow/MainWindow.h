@@ -4,7 +4,9 @@
 #include <QSplitter>
 #include <QLabel>
 #include <QLineEdit>
+#include <QDateTime>
 
+class QTimer;
 class ConnectionTreeView;
 class ConnectionTreeModel;
 class SessionTabWidget;
@@ -19,12 +21,20 @@ public:
     SessionTabWidget *tabWidget() const { return m_tabWidget; }
 
     void updateStatusBar();
+    void refreshTree();
 
 private:
     void setupUi();
     void setupMenuBar();
     void setupShortcuts();
     void toggleLeftPanel();
+    void quickConnect();
+    void checkSharedDbChanged();
+    void filterTree(const QString &text);
+    bool filterTreeRecursive(const QModelIndex &parent, const QString &text);
+    void clearTreeFilter(const QModelIndex &parent);
+
+    static qint64 s_nextQuickConnectId;
 
     QSplitter *m_splitter = nullptr;
     QWidget *m_leftPanel = nullptr;
@@ -35,4 +45,6 @@ private:
     QLabel *m_dbPathLabel = nullptr;
     QLabel *m_statusLabel = nullptr;
     bool m_leftPanelVisible = true;
+    QTimer *m_dbPollTimer = nullptr;
+    QDateTime m_lastDbModified;
 };

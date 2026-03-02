@@ -3,6 +3,7 @@
 
 #include <freerdp/freerdp.h>
 #include <freerdp/gdi/gdi.h>
+#include <freerdp/channels/rdpgfx.h>
 #include <freerdp/client/cliprdr.h>
 #include <freerdp/event.h>
 
@@ -24,6 +25,7 @@
 #include <winpr/file.h>
 #include <freerdp/utils/cliprdr_utils.h>
 
+#include <winpr/wlog.h>
 #include <cstring>
 
 RdpSession::RdpSession(const ConnectionEntry &entry,
@@ -58,6 +60,83 @@ void RdpSession::setRdpOptions(const RdpOptions &opts)
     m_rdpOptions = opts;
 }
 
+void RdpSession::setGfxChannelActive(bool active)
+{
+    m_gfxChannelActive = active;
+}
+
+void RdpSession::setDrdynvcActive(bool active)
+{
+    m_drdynvcActive = active;
+}
+
+void RdpSession::setGfxCapsConfirm(uint32_t version, uint32_t flags)
+{
+    m_gfxCapsVersion = version;
+    m_gfxCapsFlags = flags;
+}
+
+RdpSessionInfo RdpSession::sessionInfo() const
+{
+    RdpSessionInfo info;
+
+    info.hostname = m_entry.hostname;
+    info.port = m_entry.port;
+    info.username = m_username;
+
+    if (!m_instance || !m_instance->context || !m_instance->context->settings) {
+        // Not connected — return defaults from entry
+        info.width = m_requestedWidth;
+        info.height = m_requestedHeight;
+        info.colorDepth = m_entry.colorDepth;
+        return info;
+    }
+
+    rdpSettings *settings = m_instance->context->settings;
+
+    // Security
+    info.nlaSecurity = freerdp_settings_get_bool(settings, FreeRDP_NlaSecurity);
+    info.tlsSecurity = freerdp_settings_get_bool(settings, FreeRDP_TlsSecurity);
+    info.rdpSecurity = freerdp_settings_get_bool(settings, FreeRDP_RdpSecurity);
+
+    // Display
+    info.width = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth));
+    info.height = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
+    info.colorDepth = static_cast<int>(freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
+
+    // Codecs
+    info.remoteFx = freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec);
+    info.nsCodec = freerdp_settings_get_bool(settings, FreeRDP_NSCodec);
+    info.gfxPipeline = m_gfxChannelActive.load();
+
+    // GFX sub-codecs: derive from server-confirmed caps version/flags
+    uint32_t capsVer = m_gfxCapsVersion.load();
+    uint32_t capsFlags = m_gfxCapsFlags.load();
+    if (info.gfxPipeline && capsVer != 0) {
+        bool avcDisabled = (capsFlags & RDPGFX_CAPS_FLAG_AVC_DISABLED) != 0;
+        info.gfxH264 = !avcDisabled && capsVer >= RDPGFX_CAPVERSION_81;
+        info.gfxAvc444 = !avcDisabled && capsVer >= RDPGFX_CAPVERSION_10;
+        info.gfxProgressive = true;
+    }
+
+    // Performance
+    info.compression = freerdp_settings_get_bool(settings, FreeRDP_CompressionEnabled);
+    info.fastPathInput = freerdp_settings_get_bool(settings, FreeRDP_FastPathInput);
+    info.fastPathOutput = freerdp_settings_get_bool(settings, FreeRDP_FastPathOutput);
+    info.frameMarkers = freerdp_settings_get_bool(settings, FreeRDP_FrameMarkerCommandEnabled);
+    info.networkAutoDetect = freerdp_settings_get_bool(settings, FreeRDP_NetworkAutoDetect);
+    info.bitmapCache = freerdp_settings_get_bool(settings, FreeRDP_BitmapCacheEnabled);
+    info.fontSmoothing = freerdp_settings_get_bool(settings, FreeRDP_AllowFontSmoothing);
+    info.desktopComposition = freerdp_settings_get_bool(settings, FreeRDP_AllowDesktopComposition);
+
+    // Channels
+    info.clipboardActive = (m_cliprdr != nullptr);
+    info.gfxChannelActive = m_gfxChannelActive.load();
+    info.drdynvcActive = m_drdynvcActive.load();
+
+    return info;
+}
+
 void RdpSession::start()
 {
     // If stop() was already called before start() runs, bail out immediately.
@@ -90,6 +169,7 @@ void RdpSession::start()
     // Store session pointer in custom context
     auto *ctx = reinterpret_cast<RdpCustomContext *>(m_instance->context);
     ctx->session = this;
+    ctx->pendingGfx = nullptr;
 
     // Configure settings
     rdpSettings *settings = m_instance->context->settings;
@@ -141,7 +221,7 @@ void RdpSession::start()
     freerdp_settings_set_bool(settings, FreeRDP_BitmapCacheEnabled, TRUE);
     freerdp_settings_set_bool(settings, FreeRDP_BitmapCacheV3Enabled, TRUE);
     freerdp_settings_set_uint32(settings, FreeRDP_OffscreenSupportLevel, 1);
-    freerdp_settings_set_uint32(settings, FreeRDP_GlyphSupportLevel, 3); // GLYPH_SUPPORT_ENCODE
+    freerdp_settings_set_uint32(settings, FreeRDP_GlyphSupportLevel, 2); // GLYPH_SUPPORT_FULL (3=ENCODE is experimental, breaks xrdp)
 
     // ── Performance: codecs ──
     freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, m_rdpOptions.remoteFx ? TRUE : FALSE);
@@ -176,20 +256,83 @@ void RdpSession::start()
     freerdp_settings_set_uint32(settings, FreeRDP_PerformanceFlags, 0); // All visual features on
     freerdp_settings_set_uint32(settings, FreeRDP_LargePointerFlag, 1);
 
+    // ── TCP keepalive (survive transient network drops) ──
+    freerdp_settings_set_bool(settings, FreeRDP_TcpKeepAlive, TRUE);
+    freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveRetries, 6);
+    freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveDelay, 60);
+    freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveInterval, 10);
+
+    // ── Auto-reconnect (server-side cookie-based reconnect) ──
+    freerdp_settings_set_bool(settings, FreeRDP_AutoReconnectionEnabled, TRUE);
+    freerdp_settings_set_uint32(settings, FreeRDP_AutoReconnectMaxRetries, 20);
+
     // Accept all certificates (self-signed, changed, etc.)
     freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, TRUE);
 
-    if (!m_username.isEmpty()) {
-        // Credentials provided: enable NLA + auto logon
+    // Lower OpenSSL security level so FreeRDP can connect to servers with
+    // weaker certificates (e.g. 1024-bit RSA).  Level 0 = most permissive.
+    freerdp_settings_set_uint32(settings, FreeRDP_TlsSecLevel, 0);
+
+    // ── Security mode (per-connection setting) ──
+    switch (m_entry.securityMode) {
+    case RdpSecurity::NLA:
         freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE);
-        freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled, TRUE);
-    } else {
-        // No credentials: disable NLA so the server shows its login screen
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
+        break;
+    case RdpSecurity::TLS:
         freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE);
+        break;
+    case RdpSecurity::RDP:
+        freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, FALSE);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, TRUE);
+        break;
+    case RdpSecurity::Auto:
+    default:
+        if (!m_username.isEmpty()) {
+            freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE);
+        } else {
+            freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE);
+        }
+        freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE);
+        freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, TRUE);
+        break;
     }
+
+    if (!m_username.isEmpty())
+        freerdp_settings_set_bool(settings, FreeRDP_AutoLogonEnabled, TRUE);
 
     // Enable standard security negotiation
     freerdp_settings_set_bool(settings, FreeRDP_NegotiateSecurityLayer, TRUE);
+
+    // ── FreeRDP verbose logging (optional) ──
+    // Route FreeRDP's WLog through Qt's message handler → error.log
+    if (m_rdpOptions.verboseLog) {
+        wLog *root = WLog_GetRoot();
+        if (root) {
+            WLog_SetLogLevel(root, WLOG_TRACE);
+            WLog_SetLogAppenderType(root, WLOG_APPENDER_CALLBACK);
+            wLogAppender *appender = WLog_GetLogAppender(root);
+            if (appender) {
+                static wLogCallbacks callbacks = {};
+                callbacks.message = [](const wLogMessage *msg) -> BOOL {
+                    if (!msg || !msg->TextString)
+                        return TRUE;
+                    static const char *levelNames[] = {
+                        "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
+                    int lvl = static_cast<int>(msg->Level);
+                    const char *lvlStr = (lvl >= 0 && lvl <= 5) ? levelNames[lvl] : "?";
+                    qDebug("[FreeRDP][%s] %s", lvlStr, msg->TextString);
+                    return TRUE;
+                };
+                WLog_ConfigureAppender(appender, "callbacks", &callbacks);
+                WLog_OpenAppender(root);
+            }
+        }
+    }
 
     // Subscribe to PubSub channel events BEFORE freerdp_connect.
     // freerdp_channels_post_connect (called inside freerdp_connect) fires
@@ -201,14 +344,26 @@ void RdpSession::start()
                                         rdp_on_channel_disconnected);
 
     // Attempt connection
+    static const char *secNames[] = {"Auto", "NLA", "TLS", "RDP"};
+    int secIdx = static_cast<int>(m_entry.securityMode);
+    qDebug() << "RDP: connecting to" << m_entry.hostname << ":" << m_entry.port
+             << "user=" << m_username
+             << "depth=" << m_entry.colorDepth
+             << "security=" << secNames[qBound(0, secIdx, 3)]
+             << "GFX=" << m_rdpOptions.gfxPipeline
+             << "H264=" << m_rdpOptions.h264
+             << "size=" << m_requestedWidth << "x" << m_requestedHeight;
+
     if (!freerdp_connect(m_instance)) {
         UINT32 err = freerdp_get_last_error(m_instance->context);
         const char *errName = freerdp_get_last_error_name(err);
         const char *errString = freerdp_get_last_error_string(err);
-        emit errorOccurred(QStringLiteral("RDP connect failed: 0x%1 (%2: %3)")
+        QString errorMsg = QStringLiteral("RDP connect failed: 0x%1 (%2: %3)")
                                .arg(err, 8, 16, QChar('0'))
                                .arg(QString::fromUtf8(errName ? errName : "unknown"))
-                               .arg(QString::fromUtf8(errString ? errString : "")));
+                               .arg(QString::fromUtf8(errString ? errString : ""));
+        qWarning() << errorMsg;
+        emit errorOccurred(errorMsg);
         // Must disconnect before freeing context to clean up partial state
         freerdp_disconnect(m_instance);
         freerdp_context_free(m_instance);
@@ -261,6 +416,7 @@ void RdpSession::eventLoop()
         HANDLE handles[64] = {};
         DWORD count = freerdp_get_event_handles(m_instance->context, handles, 64);
         if (count == 0) {
+            qWarning() << "RDP: failed to get event handles";
             emit errorOccurred(QStringLiteral("Failed to get event handles"));
             break;
         }
@@ -271,13 +427,60 @@ void RdpSession::eventLoop()
             break;
 
         if (waitResult == WAIT_FAILED) {
+            qWarning() << "RDP: WaitForMultipleObjects failed";
             emit errorOccurred(QStringLiteral("WaitForMultipleObjects failed"));
             break;
         }
 
         if (!freerdp_check_event_handles(m_instance->context)) {
-            if (freerdp_get_last_error(m_instance->context) != FREERDP_ERROR_SUCCESS) {
-                emit errorOccurred(QStringLiteral("Connection lost"));
+            UINT32 err = freerdp_get_last_error(m_instance->context);
+            if (err != FREERDP_ERROR_SUCCESS) {
+                const char *errName = freerdp_get_last_error_name(err);
+                qWarning() << "RDP: connection ended — 0x"
+                           << QString::number(err, 16)
+                           << (errName ? errName : "");
+
+                // Extract the ERRINFO code (low 16 bits)
+                UINT32 errInfo = err & 0xFFFF;
+                bool graceful = m_stopRequested
+                    || errInfo == ERRINFO_LOGOFF_BY_USER
+                    || errInfo == ERRINFO_RPC_INITIATED_DISCONNECT_BY_USER
+                    || errInfo == ERRINFO_RPC_INITIATED_DISCONNECT
+                    || errInfo == ERRINFO_RPC_INITIATED_LOGOFF
+                    || errInfo == ERRINFO_DISCONNECTED_BY_OTHER_CONNECTION;
+
+                if (!graceful) {
+                    // Attempt reconnect before giving up
+                    static constexpr int kMaxRetries = 20;
+                    static constexpr int kRetryDelaySec = 5;
+                    bool reconnected = false;
+
+                    for (int attempt = 1; attempt <= kMaxRetries && !m_stopRequested; ++attempt) {
+                        emit reconnectStatus(
+                            QStringLiteral("Connection lost \u2014 reconnecting (attempt %1 of %2)...")
+                                .arg(attempt).arg(kMaxRetries));
+
+                        QThread::sleep(kRetryDelaySec);
+                        if (m_stopRequested)
+                            break;
+
+                        qDebug() << "RDP: reconnect attempt" << attempt << "of" << kMaxRetries;
+                        if (freerdp_reconnect(m_instance)) {
+                            qDebug() << "RDP: reconnect succeeded on attempt" << attempt;
+                            reconnected = true;
+                            break;
+                        }
+                    }
+
+                    emit reconnectStatus(QString());
+
+                    if (reconnected) {
+                        emit connected();
+                        continue; // Resume event loop
+                    }
+
+                    emit errorOccurred(QStringLiteral("Connection lost"));
+                }
             }
             break;
         }
@@ -289,6 +492,9 @@ void RdpSession::eventLoop()
 
 void RdpSession::onPostConnect(int width, int height, uint8_t *buffer, uint32_t stride)
 {
+    qDebug() << "RDP: post-connect — negotiated" << width << "x" << height
+             << "stride=" << stride;
+
     QMutexLocker lock(&m_fbMutex);
     m_width = width;
     m_height = height;
@@ -297,7 +503,7 @@ void RdpSession::onPostConnect(int width, int height, uint8_t *buffer, uint32_t 
 
     // Create our OWN framebuffer (deep copy). The UI thread reads from this,
     // never from the FreeRDP GDI buffer directly.
-    m_framebuffer = QImage(m_width, m_height, QImage::Format_ARGB32);
+    m_framebuffer = QImage(m_width, m_height, QImage::Format_RGB32);
     m_framebuffer.fill(Qt::black);
 
     // Copy initial frame from FreeRDP buffer
@@ -318,11 +524,12 @@ void RdpSession::onEndPaint(const QRect &dirtyRect)
     if (m_framebuffer.isNull() || !m_rdpBuffer)
         return;
 
-    // Clamp dirty rect to buffer dimensions
-    int x0 = qMax(0, dirtyRect.x());
-    int y0 = qMax(0, dirtyRect.y());
-    int x1 = qMin(m_width, dirtyRect.x() + dirtyRect.width());
-    int y1 = qMin(m_height, dirtyRect.y() + dirtyRect.height());
+    // Expand dirty rect by 1px on each side to catch off-by-one errors
+    // in the GFX pipeline's reported invalid region, then clamp to buffer.
+    int x0 = qMax(0, dirtyRect.x() - 1);
+    int y0 = qMax(0, dirtyRect.y() - 1);
+    int x1 = qMin(m_width, dirtyRect.x() + dirtyRect.width() + 1);
+    int y1 = qMin(m_height, dirtyRect.y() + dirtyRect.height() + 1);
 
     if (x0 >= x1 || y0 >= y1)
         return;
@@ -442,8 +649,21 @@ void RdpSession::setCliprdrContext(CliprdrClientContext *ctx)
 
 void RdpSession::onClipboardDataReceived(const QString &text)
 {
-    // Called from cliprdr callback on the worker thread.
-    // Emit signal so the UI thread can update QClipboard.
+    // If we're chaining text → files, stash the text and request files next
+    if (m_pendingFileFormatId) {
+        m_receivedClipText = text;
+        m_lastRequestedFormatId = m_pendingFileFormatId;
+        m_pendingFileFormatId = 0;
+
+        CLIPRDR_FORMAT_DATA_REQUEST request = {};
+        request.common.msgType = CB_FORMAT_DATA_REQUEST;
+        request.requestedFormatId = m_lastRequestedFormatId;
+        if (m_cliprdr && m_cliprdr->ClientFormatDataRequest)
+            m_cliprdr->ClientFormatDataRequest(m_cliprdr, &request);
+        return;
+    }
+
+    // Text-only — emit signal so the UI thread can update QClipboard.
     emit remoteClipboardChanged(text);
 }
 
@@ -540,9 +760,23 @@ bool RdpSession::isFileFormatResponse() const
 void RdpSession::onRemoteFormatList(CliprdrClientContext *cliprdr,
                                      uint32_t fileFormatId, uint32_t textFormatId)
 {
-    if (fileFormatId) {
-        // Server has files on clipboard — request the file list
-        m_fileFormatId = fileFormatId;
+    m_fileFormatId = fileFormatId;
+    m_pendingFileFormatId = 0;
+    m_receivedClipText.clear();
+
+    if (fileFormatId && textFormatId) {
+        // Both text and files — request text first, then files.
+        // This preserves the original text (e.g. UNC paths) alongside file data.
+        m_pendingFileFormatId = fileFormatId;
+        m_lastRequestedFormatId = textFormatId;
+
+        CLIPRDR_FORMAT_DATA_REQUEST request = {};
+        request.common.msgType = CB_FORMAT_DATA_REQUEST;
+        request.requestedFormatId = textFormatId;
+        if (cliprdr->ClientFormatDataRequest)
+            cliprdr->ClientFormatDataRequest(cliprdr, &request);
+    } else if (fileFormatId) {
+        // Files only
         m_lastRequestedFormatId = fileFormatId;
 
         CLIPRDR_FORMAT_DATA_REQUEST request = {};
@@ -767,7 +1001,8 @@ void RdpSession::finishFileReceive()
     }
 
     if (!paths.isEmpty())
-        emit remoteFilesReceived(paths);
+        emit remoteFilesReceived(paths, m_receivedClipText);
+    m_receivedClipText.clear();
 }
 
 // ── File clipboard: local → remote send ──────────────────────────────

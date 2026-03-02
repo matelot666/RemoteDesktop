@@ -34,5 +34,6 @@ private:
     QCheckBox *m_compressionCheck = nullptr;
     QCheckBox *m_winKeyPassthroughCheck = nullptr;
     QCheckBox *m_winKeyCopyPasteCheck = nullptr;
+    QComboBox *m_securityCombo = nullptr;
     ConnectionEntry m_entry;
 };

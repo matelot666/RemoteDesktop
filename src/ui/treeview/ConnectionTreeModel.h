@@ -55,5 +55,7 @@ private:
     QHash<qint64, qint64> m_credentialAssignments;     // connection_id -> credential_id
     QHash<qint64, FolderDefaults> m_folderDefaults;     // folder_id -> defaults
 
-    void buildTreeRecursive(TreeItem *parentItem, qint64 parentFolderId);
+    void buildTreeFromMaps(TreeItem *parentItem, qint64 parentFolderId,
+                           const QHash<qint64, QVector<ConnectionFolder>> &foldersByParent,
+                           const QHash<qint64, QVector<ConnectionEntry>> &connsByFolder);
 };

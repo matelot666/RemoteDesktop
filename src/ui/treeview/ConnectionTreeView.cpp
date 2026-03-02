@@ -9,6 +9,27 @@
 #include <QHeaderView>
 #include <QMimeData>
 #include <QIODevice>
+#include <QTimer>
+#include <QPainter>
+#include <QStyledItemDelegate>
+
+// Delegate that draws a highlight flash on the active flash row
+class FlashDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    ConnectionTreeView *treeView() const { return static_cast<ConnectionTreeView *>(parent()); }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        QStyledItemDelegate::paint(painter, option, index);
+        auto *tv = treeView();
+        if (tv->m_flashStep > 0 && tv->m_flashIndex.isValid() && index == tv->m_flashIndex) {
+            int alpha = tv->m_flashStep * 18;  // 8 steps × 18 = 144 max alpha
+            painter->fillRect(option.rect, QColor(100, 180, 255, alpha));
+        }
+    }
+};
 
 ConnectionTreeView::ConnectionTreeView(QWidget *parent)
     : QTreeView(parent)
@@ -21,6 +42,18 @@ ConnectionTreeView::ConnectionTreeView(QWidget *parent)
     setDragDropMode(QAbstractItemView::InternalMove);
     setAnimated(true);
     setExpandsOnDoubleClick(false);
+    setItemDelegate(new FlashDelegate(this));
+
+    m_flashTimer = new QTimer(this);
+    m_flashTimer->setInterval(30);
+    connect(m_flashTimer, &QTimer::timeout, this, [this]() {
+        if (--m_flashStep <= 0) {
+            m_flashStep = 0;
+            m_flashTimer->stop();
+        }
+        if (m_flashIndex.isValid())
+            update(m_flashIndex);
+    });
 }
 
 void ConnectionTreeView::setModel(QAbstractItemModel *model)
@@ -35,7 +68,12 @@ void ConnectionTreeView::mouseDoubleClickEvent(QMouseEvent *event)
     if (index.isValid() && m_model) {
         auto *item = m_model->itemFromIndex(index);
         if (item && item->nodeType() == TreeNodeType::Connection) {
+            flashRow(index);
             emit connectRequested(index);
+            return;
+        }
+        if (item && item->nodeType() == TreeNodeType::Folder) {
+            setExpanded(index, !isExpanded(index));
             return;
         }
     }
@@ -514,6 +552,16 @@ int ConnectionTreeView::countConnectedUnder(TreeItem *item) const
         }
     }
     return count;
+}
+
+// -- Double-click flash animation ---------------------------------------
+
+void ConnectionTreeView::flashRow(const QModelIndex &index)
+{
+    m_flashIndex = QPersistentModelIndex(index);
+    m_flashStep = 8;  // ~240ms fade-out (8 × 30ms)
+    m_flashTimer->start();
+    update(index);
 }
 
 // -- Expansion state save/restore ---------------------------------------

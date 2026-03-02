@@ -4,13 +4,16 @@
 #include <QThread>
 #include <QDir>
 #include <QFile>
+#include <QStringList>
 #include <QCoreApplication>
 
 #ifdef _WIN32
 #include <ws2tcpip.h>   // getaddrinfo, freeaddrinfo, sockaddr, etc.
+#include <mstcpip.h>    // tcp_keepalive struct
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -44,7 +47,11 @@ void SshSession::start()
     if (m_stopRequested)
         return;
 
+    qDebug() << "SSH: connecting to" << m_entry.hostname << ":" << m_entry.port
+             << "user=" << m_username;
+
     if (!connectTcp()) {
+        qWarning() << "SSH: TCP connection failed to" << m_entry.hostname << ":" << m_entry.port;
         emit errorOccurred(QStringLiteral("TCP connection failed to %1:%2")
                                .arg(m_entry.hostname).arg(m_entry.port));
         cleanup();
@@ -61,6 +68,9 @@ void SshSession::start()
     libssh2_session_set_blocking(m_session, 1);
 
     if (!performHandshake()) {
+        char *errmsg = nullptr;
+        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
+        qWarning() << "SSH: handshake failed —" << (errmsg ? errmsg : "unknown error");
         emit errorOccurred(QStringLiteral("SSH handshake failed"));
         cleanup();
         return;
@@ -73,6 +83,9 @@ void SshSession::start()
     }
 
     if (!m_channel.open(m_session, m_cols, m_rows)) {
+        char *errmsg = nullptr;
+        libssh2_session_last_error(m_session, &errmsg, nullptr, 0);
+        qWarning() << "SSH: channel open failed —" << (errmsg ? errmsg : "unknown error");
         emit errorOccurred(QStringLiteral("Failed to open SSH channel"));
         cleanup();
         return;
@@ -80,6 +93,12 @@ void SshSession::start()
 
     // Switch to non-blocking for the read loop
     libssh2_session_set_blocking(m_session, 0);
+
+    // Enable keepalive — send a probe every 15s so both ends detect drops sooner
+    libssh2_keepalive_config(m_session, 1, 15);
+
+    // TCP keepalive — OS-level probes survive longer than SSH keepalive
+    setTcpKeepalive();
 
     emit connected();
     m_running = true;
@@ -118,6 +137,97 @@ void SshSession::cleanup()
     }
 }
 
+void SshSession::forceCleanup()
+{
+    // Non-graceful shutdown — close socket first to prevent blocking in libssh2
+    m_channel.forceClose();
+
+    if (m_socket != kInvalidSocket) {
+#ifdef _WIN32
+        closesocket(m_socket);
+#else
+        ::close(m_socket);
+#endif
+        m_socket = kInvalidSocket;
+    }
+
+    if (m_session) {
+        libssh2_session_free(m_session);
+        m_session = nullptr;
+    }
+}
+
+void SshSession::setTcpKeepalive()
+{
+    if (m_socket == kInvalidSocket)
+        return;
+
+    int enable = 1;
+    setsockopt(m_socket, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&enable), sizeof(enable));
+
+#ifdef _WIN32
+    // Windows: use SIO_KEEPALIVE_VALS
+    struct tcp_keepalive ka = {};
+    ka.onoff = 1;
+    ka.keepalivetime = 60000;     // 60s idle before first probe
+    ka.keepaliveinterval = 10000; // 10s between probes
+    DWORD bytesReturned = 0;
+    WSAIoctl(m_socket, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &bytesReturned, nullptr, nullptr);
+#elif defined(Q_OS_MACOS)
+    int idle = 60;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    int intvl = 10;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt = 6;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#else
+    int idle = 60;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int intvl = 10;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt = 6;
+    setsockopt(m_socket, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
+bool SshSession::reconnect()
+{
+    forceCleanup();
+
+    if (!connectTcp())
+        return false;
+
+    setTcpKeepalive();
+
+    m_session = libssh2_session_init();
+    if (!m_session) {
+        forceCleanup();
+        return false;
+    }
+
+    libssh2_session_set_blocking(m_session, 1);
+
+    if (!performHandshake()) {
+        forceCleanup();
+        return false;
+    }
+
+    if (!authenticate()) {
+        forceCleanup();
+        return false;
+    }
+
+    if (!m_channel.open(m_session, m_cols, m_rows)) {
+        forceCleanup();
+        return false;
+    }
+
+    libssh2_session_set_blocking(m_session, 0);
+    libssh2_keepalive_config(m_session, 1, 15);
+
+    return true;
+}
+
 bool SshSession::connectTcp()
 {
     QByteArray host = m_entry.hostname.toUtf8();
@@ -129,7 +239,15 @@ bool SshSession::connectTcp()
     QByteArray portStr = QByteArray::number(m_entry.port);
     struct addrinfo *result = nullptr;
 
-    if (getaddrinfo(host.constData(), portStr.constData(), &hints, &result) != 0) {
+    int gaiErr = getaddrinfo(host.constData(), portStr.constData(), &hints, &result);
+    if (gaiErr != 0) {
+#ifdef _WIN32
+        qWarning() << "SSH: DNS resolution failed for" << m_entry.hostname
+                   << "—" << QString::fromWCharArray(gai_strerror(gaiErr));
+#else
+        qWarning() << "SSH: DNS resolution failed for" << m_entry.hostname
+                   << "—" << gai_strerror(gaiErr);
+#endif
         return false;
     }
 
@@ -315,7 +433,15 @@ bool SshSession::authenticate()
         }
     }
 
-    qWarning() << "SSH: all authentication methods failed";
+    QStringList tried;
+    tried << QStringLiteral("agent");
+    if (!m_privateKey.isEmpty())
+        tried << QStringLiteral("private-key");
+    if (m_privateKey.isEmpty())
+        tried << QStringLiteral("default-keys");
+    if (!m_password.isEmpty())
+        tried << QStringLiteral("password") << QStringLiteral("keyboard-interactive");
+    qWarning() << "SSH: all authentication methods failed — tried:" << tried.join(QStringLiteral(", "));
     return false;
 }
 
@@ -357,7 +483,43 @@ void SshSession::readLoop()
         } else if (bytesRead == LIBSSH2_ERROR_EAGAIN) {
             continue;
         } else if (bytesRead < 0) {
-            emit errorOccurred(QStringLiteral("SSH read error"));
+            // If channel has EOF, this is a clean disconnect (user typed exit, etc.)
+            if (m_channel.isOpen() && libssh2_channel_eof(m_channel.rawChannel()))
+                break;
+
+            if (m_stopRequested)
+                break;
+
+            // Attempt reconnect before giving up
+            static constexpr int kMaxRetries = 20;
+            static constexpr int kRetryDelaySec = 5;
+            bool reconnected = false;
+
+            for (int attempt = 1; attempt <= kMaxRetries && !m_stopRequested; ++attempt) {
+                emit reconnectStatus(
+                    QStringLiteral("Connection lost \u2014 reconnecting (attempt %1 of %2)...")
+                        .arg(attempt).arg(kMaxRetries));
+
+                QThread::sleep(kRetryDelaySec);
+                if (m_stopRequested)
+                    break;
+
+                qDebug() << "SSH: reconnect attempt" << attempt << "of" << kMaxRetries;
+                if (reconnect()) {
+                    qDebug() << "SSH: reconnect succeeded on attempt" << attempt;
+                    reconnected = true;
+                    break;
+                }
+            }
+
+            emit reconnectStatus(QString());
+
+            if (reconnected) {
+                emit connected();
+                continue; // Resume read loop with new connection
+            }
+
+            emit errorOccurred(QStringLiteral("SSH connection lost"));
             break;
         } else if (bytesRead == 0) {
             if (m_channel.isOpen() && libssh2_channel_eof(m_channel.rawChannel())) {
@@ -371,14 +533,48 @@ void SshSession::readLoop()
     emit disconnected();
 }
 
+int SshSession::waitsocket()
+{
+    int dir = libssh2_session_block_directions(m_session);
+#ifdef _WIN32
+    WSAPOLLFD pfd;
+#else
+    struct pollfd pfd;
+#endif
+    pfd.fd = m_socket;
+    pfd.events = 0;
+    pfd.revents = 0;
+    if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
+        pfd.events |= POLLIN;
+    if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+        pfd.events |= POLLOUT;
+#ifdef _WIN32
+    return WSAPoll(&pfd, 1, 50);
+#else
+    return ::poll(&pfd, 1, 50);
+#endif
+}
+
 void SshSession::write(const QByteArray &data)
 {
     if (!m_running || !m_channel.isOpen())
         return;
 
-    libssh2_session_set_blocking(m_session, 1);
-    m_channel.write(data.constData(), data.size());
-    libssh2_session_set_blocking(m_session, 0);
+    const char *ptr = data.constData();
+    size_t remaining = static_cast<size_t>(data.size());
+
+    while (remaining > 0 && m_running) {
+        int written = m_channel.write(ptr, remaining);
+        if (written > 0) {
+            ptr += written;
+            remaining -= static_cast<size_t>(written);
+        } else if (written == LIBSSH2_ERROR_EAGAIN) {
+            waitsocket();
+        } else {
+            qWarning() << "SSH write error:" << written;
+            break;
+        }
+    }
 }
 
 void SshSession::requestPtyResize(int cols, int rows)
@@ -386,7 +582,10 @@ void SshSession::requestPtyResize(int cols, int rows)
     if (!m_running || !m_channel.isOpen())
         return;
 
-    libssh2_session_set_blocking(m_session, 1);
-    m_channel.requestPtyResize(cols, rows);
-    libssh2_session_set_blocking(m_session, 0);
+    int rc;
+    while ((rc = m_channel.requestPtyResize(cols, rows)) == LIBSSH2_ERROR_EAGAIN && m_running) {
+        waitsocket();
+    }
+    if (rc != 0)
+        qWarning() << "SSH PTY resize failed:" << rc;
 }

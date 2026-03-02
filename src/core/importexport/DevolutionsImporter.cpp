@@ -10,53 +10,242 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QXmlStreamReader>
 #include <QMap>
 
-// Devolutions RDM ConnectionType integer values
-static constexpr int RDM_TYPE_RDP = 1;
-static constexpr int RDM_TYPE_SSH = 8;
-static constexpr int RDM_TYPE_GROUP = 25;
-static constexpr int RDM_TYPE_TERMINAL = 77;
+namespace {
 
-ImportResult DevolutionsImporter::importFromFile(const QString &filePath,
-                                                  ConnectionDatabase *db,
-                                                  UserDatabase *userDb,
-                                                  CredentialVault *vault)
+struct ConnRecord {
+    QString name;
+    QString group;
+    QString connType;
+    QString hostname;
+    int port = 0;
+    QString credUser;
+    QString credPass;
+    QString credDomain;
+};
+
+// --- XML parsing -----------------------------------------------------------
+
+// Skip the current element and all its descendants.
+static void skipElement(QXmlStreamReader &xml)
 {
-    ImportResult result;
+    int depth = 1;
+    while (!xml.atEnd() && depth > 0) {
+        xml.readNext();
+        if (xml.isStartElement())
+            ++depth;
+        else if (xml.isEndElement())
+            --depth;
+    }
+}
 
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly)) {
-        result.warnings.append(QStringLiteral("Could not open file: %1").arg(filePath));
-        return result;
+// Read all child elements of a <Connection> into a flat string map.
+// Simple children: <Url>text</Url> → "Url" = "text"
+// One-level nesting: <Putty><Host>text</Host></Putty> → "Putty/Host" = "text"
+// Deeper nesting (e.g. <Security><Permissions>...) is skipped.
+static QMap<QString, QString> readConnectionElement(QXmlStreamReader &xml)
+{
+    QMap<QString, QString> fields;
+
+    // We are positioned on <Connection>. Read until its closing tag.
+    while (!xml.atEnd()) {
+        xml.readNext();
+        if (xml.isEndElement())
+            break; // </Connection>
+        if (!xml.isStartElement())
+            continue;
+
+        // Depth-1 child of <Connection>
+        QString tag = xml.name().toString();
+
+        // Use readElementText with SkipChildElements for leaf nodes.
+        // But first peek to see if this has child elements — if so, read them
+        // as "Parent/Child" keys instead.
+        xml.readNext();
+
+        if (xml.isEndElement()) {
+            // Empty element like <Foo/>
+            continue;
+        }
+
+        if (xml.isCharacters() || xml.isWhitespace()) {
+            // Could be a simple text element, or whitespace before a child element.
+            // Accumulate text, then check what follows.
+            QString text = xml.text().toString();
+            xml.readNext();
+
+            if (xml.isEndElement()) {
+                // Simple text element: <Tag>text</Tag>
+                text = text.trimmed();
+                if (!text.isEmpty())
+                    fields[tag] = text;
+                continue;
+            }
+
+            if (xml.isStartElement()) {
+                // Had whitespace then a child — fall through to nested handling
+            } else {
+                // Something unexpected — skip the rest
+                skipElement(xml);
+                continue;
+            }
+        }
+
+        if (xml.isStartElement()) {
+            // Nested element: read depth-2 children as "Parent/Child" keys.
+            // We're already positioned on the first child start element.
+            do {
+                QString childTag = xml.name().toString();
+                // readElementText handles text content and skips any deeper nesting
+                QString childText = xml.readElementText(QXmlStreamReader::SkipChildElements).trimmed();
+                if (!childText.isEmpty())
+                    fields[tag + QStringLiteral("/") + childTag] = childText;
+
+                // Advance to next sibling or parent end
+                while (!xml.atEnd()) {
+                    xml.readNext();
+                    if (xml.isStartElement())
+                        break;        // next sibling
+                    if (xml.isEndElement())
+                        goto doneTag; // </Parent>
+                }
+            } while (xml.isStartElement());
+            doneTag:;
+        }
+    }
+    return fields;
+}
+
+static ConnRecord recordFromXmlFields(const QMap<QString, QString> &fields)
+{
+    ConnRecord rec;
+    rec.name = fields.value(QStringLiteral("Name"));
+    rec.group = fields.value(QStringLiteral("Group"));
+    rec.connType = fields.value(QStringLiteral("ConnectionType"));
+
+    if (rec.connType == QStringLiteral("RDPConfigured")) {
+        rec.hostname = fields.value(QStringLiteral("Url"));
+        rec.port = fields.value(QStringLiteral("Port"), QStringLiteral("3389")).toInt();
+    } else if (rec.connType == QStringLiteral("SSHShell")) {
+        rec.hostname = fields.value(QStringLiteral("Terminal/Host"));
+        rec.port = fields.value(QStringLiteral("Terminal/Port"), QStringLiteral("22")).toInt();
+    } else if (rec.connType == QStringLiteral("Putty")) {
+        rec.hostname = fields.value(QStringLiteral("Putty/Host"));
+        rec.port = fields.value(QStringLiteral("Putty/SessionPort"),
+                                fields.value(QStringLiteral("Putty/Port"), QStringLiteral("22"))).toInt();
     }
 
-    QJsonParseError parseError;
-    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
-    file.close();
+    rec.credUser = fields.value(QStringLiteral("Credentials/UserName"));
+    rec.credPass = fields.value(QStringLiteral("Credentials/Password"));
+    rec.credDomain = fields.value(QStringLiteral("Credentials/Domain"));
+    return rec;
+}
 
+static bool parseXml(const QByteArray &data, QVector<ConnRecord> &records, QStringList &warnings)
+{
+    QXmlStreamReader xml(data);
+
+    while (!xml.atEnd()) {
+        xml.readNext();
+        if (xml.isStartElement() && xml.name() == QStringLiteral("Connection"))
+            records.append(recordFromXmlFields(readConnectionElement(xml)));
+    }
+
+    if (xml.hasError() && records.isEmpty()) {
+        warnings.append(QStringLiteral("XML parse error: %1").arg(xml.errorString()));
+        return false;
+    }
+    return true;
+}
+
+// --- JSON parsing ----------------------------------------------------------
+
+// Devolutions RDM JSON uses integer ConnectionType values
+static constexpr int RDM_JSON_TYPE_RDP = 1;
+static constexpr int RDM_JSON_TYPE_SSH = 8;
+static constexpr int RDM_JSON_TYPE_GROUP = 25;
+static constexpr int RDM_JSON_TYPE_TERMINAL = 77;
+
+static QString connTypeStringFromInt(int type)
+{
+    switch (type) {
+    case RDM_JSON_TYPE_RDP:      return QStringLiteral("RDPConfigured");
+    case RDM_JSON_TYPE_SSH:      return QStringLiteral("Putty");
+    case RDM_JSON_TYPE_GROUP:    return QStringLiteral("Group");
+    case RDM_JSON_TYPE_TERMINAL: return QStringLiteral("SSHShell");
+    default:                     return QString::number(type);
+    }
+}
+
+static bool parseJson(const QByteArray &data, QVector<ConnRecord> &records, QStringList &warnings)
+{
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
     if (parseError.error != QJsonParseError::NoError) {
-        result.warnings.append(QStringLiteral("JSON parse error: %1").arg(parseError.errorString()));
-        return result;
+        warnings.append(QStringLiteral("JSON parse error: %1").arg(parseError.errorString()));
+        return false;
     }
 
     QJsonArray connections = doc.object().value(QStringLiteral("Connections")).toArray();
     if (connections.isEmpty()) {
-        result.warnings.append(QStringLiteral("No 'Connections' array found in JSON."));
-        return result;
+        warnings.append(QStringLiteral("No 'Connections' array found in JSON."));
+        return false;
     }
-
-    // First pass: collect unique group paths and create folders (in shared DB)
-    QMap<QString, qint64> folderPathMap;
-    folderPathMap[QString()] = -1; // root
 
     for (const auto &val : connections) {
         QJsonObject obj = val.toObject();
-        QString group = obj.value(QStringLiteral("Group")).toString();
-        if (group.isEmpty())
+
+        ConnRecord rec;
+        rec.name = obj.value(QStringLiteral("Name")).toString();
+        rec.group = obj.value(QStringLiteral("Group")).toString();
+
+        // JSON format uses integer ConnectionType — normalise to XML string names
+        int connTypeInt = obj.value(QStringLiteral("ConnectionType")).toInt(-1);
+        rec.connType = connTypeStringFromInt(connTypeInt);
+
+        if (rec.connType == QStringLiteral("RDPConfigured")) {
+            rec.hostname = obj.value(QStringLiteral("Url")).toString();
+            rec.port = obj.value(QStringLiteral("Port")).toInt(3389);
+        } else if (rec.connType == QStringLiteral("SSHShell")) {
+            QJsonObject terminal = obj.value(QStringLiteral("Terminal")).toObject();
+            rec.hostname = terminal.value(QStringLiteral("Host")).toString();
+            rec.port = terminal.value(QStringLiteral("Port")).toInt(22);
+        } else if (rec.connType == QStringLiteral("Putty")) {
+            QJsonObject putty = obj.value(QStringLiteral("Putty")).toObject();
+            rec.hostname = putty.value(QStringLiteral("Host")).toString();
+            rec.port = putty.value(QStringLiteral("SessionPort")).toInt(
+                putty.value(QStringLiteral("Port")).toInt(22));
+        }
+
+        QJsonObject creds = obj.value(QStringLiteral("Credentials")).toObject();
+        rec.credUser = creds.value(QStringLiteral("UserName")).toString();
+        rec.credPass = creds.value(QStringLiteral("Password")).toString();
+        rec.credDomain = creds.value(QStringLiteral("Domain")).toString();
+
+        records.append(rec);
+    }
+    return true;
+}
+
+// --- Common import logic ---------------------------------------------------
+
+static void importRecords(const QVector<ConnRecord> &records,
+                          ConnectionDatabase *db,
+                          UserDatabase *userDb,
+                          CredentialVault *vault,
+                          ImportResult &result)
+{
+    // First pass: create folder hierarchy
+    QMap<QString, qint64> folderPathMap;
+    folderPathMap[QString()] = -1; // root
+
+    for (const auto &rec : records) {
+        if (rec.group.isEmpty())
             continue;
 
-        QStringList segments = group.split(QStringLiteral("\\"), Qt::SkipEmptyParts);
+        QStringList segments = rec.group.split(QStringLiteral("\\"), Qt::SkipEmptyParts);
         QString currentPath;
         qint64 parentId = -1;
 
@@ -96,31 +285,20 @@ ImportResult DevolutionsImporter::importFromFile(const QString &filePath,
         }
     }
 
-    // Second pass: import connections (to shared DB) and credentials (to user DB)
-    for (const auto &val : connections) {
-        QJsonObject obj = val.toObject();
-        int connType = obj.value(QStringLiteral("ConnectionType")).toInt(-1);
-
+    // Second pass: import connections and credentials
+    for (const auto &rec : records) {
         Protocol protocol;
-        QString hostname;
-        int port = 0;
+        QString hostname = rec.hostname;
+        int port = rec.port;
 
-        if (connType == RDM_TYPE_RDP) {
+        if (rec.connType == QStringLiteral("RDPConfigured")) {
             protocol = Protocol::RDP;
-            hostname = obj.value(QStringLiteral("Url")).toString();
-            port = obj.value(QStringLiteral("Port")).toInt(3389);
-        } else if (connType == RDM_TYPE_SSH) {
+            if (port == 0) port = 3389;
+        } else if (rec.connType == QStringLiteral("SSHShell") ||
+                   rec.connType == QStringLiteral("Putty")) {
             protocol = Protocol::SSH;
-            QJsonObject putty = obj.value(QStringLiteral("Putty")).toObject();
-            hostname = putty.value(QStringLiteral("Host")).toString();
-            port = putty.value(QStringLiteral("SessionPort")).toInt(
-                putty.value(QStringLiteral("Port")).toInt(22));
-        } else if (connType == RDM_TYPE_TERMINAL) {
-            protocol = Protocol::SSH;
-            QJsonObject terminal = obj.value(QStringLiteral("Terminal")).toObject();
-            hostname = terminal.value(QStringLiteral("Host")).toString();
-            port = terminal.value(QStringLiteral("Port")).toInt(22);
-        } else if (connType == RDM_TYPE_GROUP) {
+            if (port == 0) port = 22;
+        } else if (rec.connType == QStringLiteral("Group")) {
             continue;
         } else {
             result.skipped++;
@@ -129,55 +307,94 @@ ImportResult DevolutionsImporter::importFromFile(const QString &filePath,
 
         if (hostname.isEmpty()) {
             result.skipped++;
-            result.warnings.append(QStringLiteral("Skipped (no host): %1")
-                                       .arg(obj.value(QStringLiteral("Name")).toString()));
+            result.warnings.append(QStringLiteral("Skipped (no host): %1").arg(rec.name));
             continue;
         }
 
         ConnectionEntry entry;
-        entry.name = obj.value(QStringLiteral("Name")).toString();
+        entry.name = rec.name.isEmpty() ? hostname : rec.name;
         entry.hostname = hostname;
         entry.protocol = protocol;
         entry.port = port;
+        entry.folderId = folderPathMap.value(rec.group, -1);
 
-        // Resolve folder
-        QString group = obj.value(QStringLiteral("Group")).toString();
-        entry.folderId = folderPathMap.value(group, -1);
-
-        if (entry.name.isEmpty())
-            entry.name = entry.hostname;
-
-        // Insert connection into shared DB (no credential_id)
         entry.id = db->insertConnection(entry);
         if (entry.id <= 0)
             continue;
 
         result.connectionsImported++;
 
-        // Handle inline credentials -> insert to user DB + create assignment
-        QJsonObject creds = obj.value(QStringLiteral("Credentials")).toObject();
-        if (!creds.isEmpty() && userDb && vault && vault->isUnlocked()) {
-            QString username = creds.value(QStringLiteral("UserName")).toString();
-            QString password = creds.value(QStringLiteral("Password")).toString();
-            QString domain = creds.value(QStringLiteral("Domain")).toString();
-
-            if (!username.isEmpty()) {
-                Credential cred;
-                cred.name = entry.name + QStringLiteral(" (imported)");
-                cred.type = CredentialType::UsernamePassword;
-                if (!domain.isEmpty())
-                    cred.username = domain + QStringLiteral("\\") + username;
-                else
-                    cred.username = username;
-                cred.password = password;
-                cred = vault->encryptCredential(cred);
-                cred.id = userDb->insertCredential(cred);
-                if (cred.id > 0) {
-                    userDb->setCredentialAssignment(entry.id, cred.id);
-                }
+        // Handle inline credentials
+        if (!rec.credUser.isEmpty() && userDb && vault && vault->isUnlocked()) {
+            Credential cred;
+            cred.name = entry.name + QStringLiteral(" (imported)");
+            cred.type = CredentialType::UsernamePassword;
+            if (!rec.credDomain.isEmpty())
+                cred.username = rec.credDomain + QStringLiteral("\\") + rec.credUser;
+            else
+                cred.username = rec.credUser;
+            cred.password = rec.credPass;
+            cred = vault->encryptCredential(cred);
+            cred.id = userDb->insertCredential(cred);
+            if (cred.id > 0) {
+                userDb->setCredentialAssignment(entry.id, cred.id);
             }
         }
     }
+}
 
+} // anonymous namespace
+
+ImportResult DevolutionsImporter::importFromFile(const QString &filePath,
+                                                  ConnectionDatabase *db,
+                                                  UserDatabase *userDb,
+                                                  CredentialVault *vault)
+{
+    ImportResult result;
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        result.warnings.append(QStringLiteral("Could not open file: %1").arg(filePath));
+        return result;
+    }
+
+    QByteArray data = file.readAll();
+    file.close();
+
+    if (data.isEmpty()) {
+        result.warnings.append(QStringLiteral("File is empty."));
+        return result;
+    }
+
+    // Detect format: XML starts with '<', JSON starts with '{'
+    QVector<ConnRecord> records;
+    char first = '\0';
+    for (int i = 0; i < data.size(); ++i) {
+        char c = data.at(i);
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+            first = c;
+            break;
+        }
+    }
+
+    bool ok = false;
+    if (first == '<') {
+        ok = parseXml(data, records, result.warnings);
+    } else if (first == '{' || first == '[') {
+        ok = parseJson(data, records, result.warnings);
+    } else {
+        result.warnings.append(QStringLiteral("Unrecognised file format (expected XML or JSON)."));
+        return result;
+    }
+
+    if (!ok)
+        return result;
+
+    if (records.isEmpty()) {
+        result.warnings.append(QStringLiteral("No connections found in file."));
+        return result;
+    }
+
+    importRecords(records, db, userDb, vault, result);
     return result;
 }

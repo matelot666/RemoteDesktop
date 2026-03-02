@@ -33,7 +33,8 @@ inline const QString CreateConnections = QStringLiteral(R"(
         enable_clipboard    INTEGER NOT NULL DEFAULT 1,
         enable_compression  INTEGER NOT NULL DEFAULT 1,
         win_key_passthrough INTEGER NOT NULL DEFAULT 1,
-        win_key_copy_paste  INTEGER NOT NULL DEFAULT 1
+        win_key_copy_paste  INTEGER NOT NULL DEFAULT 1,
+        security_mode       INTEGER NOT NULL DEFAULT 0
     )
 )");
 

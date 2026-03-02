@@ -36,6 +36,36 @@ struct RdpOptions {
     bool h264 = false;
     bool remoteFx = true;
     bool fontSmoothing = true;
+    bool verboseLog = false;
+};
+
+struct RdpSessionInfo {
+    QString hostname;
+    int port = 0;
+    QString username;
+    bool nlaSecurity = false;
+    bool tlsSecurity = false;
+    bool rdpSecurity = false;
+    int width = 0;
+    int height = 0;
+    int colorDepth = 0;
+    bool remoteFx = false;
+    bool nsCodec = false;
+    bool gfxPipeline = false;
+    bool gfxProgressive = false;
+    bool gfxAvc444 = false;
+    bool gfxH264 = false;
+    bool compression = false;
+    bool fastPathInput = false;
+    bool fastPathOutput = false;
+    bool frameMarkers = false;
+    bool networkAutoDetect = false;
+    bool bitmapCache = false;
+    bool fontSmoothing = false;
+    bool desktopComposition = false;
+    bool clipboardActive = false;
+    bool gfxChannelActive = false;
+    bool drdynvcActive = false;
 };
 
 class RdpSession : public QObject {
@@ -69,6 +99,11 @@ public:
     void setDesktopSize(int width, int height);
     void setRdpOptions(const RdpOptions &opts);
 
+    RdpSessionInfo sessionInfo() const;
+    void setGfxChannelActive(bool active);
+    void setDrdynvcActive(bool active);
+    void setGfxCapsConfirm(uint32_t version, uint32_t flags);
+
     // Clipboard bridge
     void setCliprdrContext(CliprdrClientContext *ctx);
     void onClipboardDataReceived(const QString &text);
@@ -96,9 +131,10 @@ signals:
     void connected();
     void disconnected();
     void errorOccurred(const QString &message);
+    void reconnectStatus(const QString &message);
     void framebufferUpdated(const QRect &dirtyRect);
     void remoteClipboardChanged(const QString &text);
-    void remoteFilesReceived(const QStringList &localPaths);
+    void remoteFilesReceived(const QStringList &localPaths, const QString &originalText);
 
 private:
     void eventLoop();
@@ -127,6 +163,8 @@ private:
     bool m_serverSupportsFileClip = false;
     uint32_t m_fileFormatId = 0;
     uint32_t m_lastRequestedFormatId = 0;
+    uint32_t m_pendingFileFormatId = 0;   // File format to request after text completes
+    QString m_receivedClipText;            // Original text received alongside files
 
     // Remote → Local
     std::unique_ptr<QTemporaryDir> m_recvTempDir;
@@ -147,4 +185,10 @@ private:
     void buildLocalFileList(const QList<QUrl> &urls);
     void addDirectoryEntries(const QString &dirPath, const QString &prefix);
     void refreshLocalFilesFromClipboard();
+
+    // Channel state (set from worker thread callbacks, read from UI thread)
+    std::atomic<bool> m_gfxChannelActive{false};
+    std::atomic<bool> m_drdynvcActive{false};
+    std::atomic<uint32_t> m_gfxCapsVersion{0};
+    std::atomic<uint32_t> m_gfxCapsFlags{0};
 };

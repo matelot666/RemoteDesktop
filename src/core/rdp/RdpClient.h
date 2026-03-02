@@ -12,6 +12,7 @@ class RdpSession;
 struct RdpCustomContext {
     rdpContext context; // Must be first member
     RdpSession *session;
+    void *pendingGfx; // Deferred RdpgfxClientContext* if GFX channel connected before post_connect
 };
 
 // FreeRDP C callback functions

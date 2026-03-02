@@ -48,6 +48,7 @@ public:
 private:
     bool createTables();
     void migrate();
+    bool deleteFolderRecursive(qint64 id);
     QSqlDatabase m_db;
     QString m_connectionName;
 };

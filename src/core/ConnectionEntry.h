@@ -17,6 +17,7 @@ struct ConnectionEntry {
     bool enableCompression = true;
     bool winKeyPassthrough = true;
     bool winKeyCopyPaste = true;
+    RdpSecurity securityMode = RdpSecurity::Auto;
 
     int defaultPort() const {
         return protocol == Protocol::SSH ? 22 : 3389;

@@ -2,6 +2,7 @@
 
 #include <QWidget>
 #include <QImage>
+#include <QLabel>
 #include <QThread>
 #include <QTimer>
 #include <QSet>
@@ -19,6 +20,7 @@ public:
     void connectSession();
     void disconnectSession();
     qint64 connectionId() const { return m_entry.id; }
+    RdpSession *rdpSession() const { return m_session; }
 
 signals:
     void sessionConnected();
@@ -52,6 +54,8 @@ private:
     double m_scale = 1.0;
     QPoint m_offset;
     QSet<uint32_t> m_pressedKeys; // Track keys sent as down (scancode | extended<<16)
+    QLabel *m_reconnectOverlay = nullptr;
+    bool m_suppressClipboardEcho = false; // Suppress re-announcing clipboard we just received from remote
 #ifdef Q_OS_MACOS
     bool m_cmdHeld = false;        // Tracks whether Cmd is currently held (for Cmd→Ctrl translation)
     bool m_ctrlSentForEdit = false; // Tracks whether synthetic Ctrl-down was sent for edit key

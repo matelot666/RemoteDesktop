@@ -24,6 +24,11 @@ SshSessionWidget::SshSessionWidget(const ConnectionEntry &entry,
     m_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     m_font.setPointSize(13);
     calculateCellSize();
+    initFontVariants();
+
+    // Allocate initial back buffer so damage callbacks before first resizeEvent work
+    m_backBuffer = QPixmap(m_cols * m_cellWidth, m_rows * m_cellHeight);
+    m_backBuffer.fill(QColor(30, 30, 30));
 
     setupVterm();
 
@@ -37,6 +42,16 @@ SshSessionWidget::SshSessionWidget(const ConnectionEntry &entry,
         emit sessionDisconnected();
     });
     connect(m_session, &SshSession::errorOccurred, this, &SshSessionWidget::sessionError);
+    connect(m_session, &SshSession::reconnectStatus, this, [this](const QString &msg) {
+        if (msg.isEmpty()) {
+            m_reconnectOverlay->hide();
+        } else {
+            m_reconnectOverlay->setText(msg);
+            m_reconnectOverlay->setGeometry(rect());
+            m_reconnectOverlay->show();
+            m_reconnectOverlay->raise();
+        }
+    });
     connect(m_session, &SshSession::dataReceived,
             this, &SshSessionWidget::onDataReceived, Qt::QueuedConnection);
     connect(this, &SshSessionWidget::writeRequested,
@@ -45,14 +60,28 @@ SshSessionWidget::SshSessionWidget(const ConnectionEntry &entry,
             m_session, &SshSession::requestPtyResize, Qt::QueuedConnection);
     connect(m_workerThread, &QThread::finished, m_session, &QObject::deleteLater);
 
-    // Cursor blink timer
+    // Cursor blink timer — only invalidates the cursor cell, not the whole widget
     m_blinkTimer = new QTimer(this);
     m_blinkTimer->setInterval(530);
     connect(m_blinkTimer, &QTimer::timeout, this, [this]() {
         m_cursorVisible = !m_cursorVisible;
-        update();
+        if (m_vterm) {
+            VTermPos pos;
+            vterm_state_get_cursorpos(vterm_obtain_state(m_vterm), &pos);
+            update(QRect(pos.col * m_cellWidth, pos.row * m_cellHeight,
+                         m_cellWidth, m_cellHeight));
+        }
     });
     m_blinkTimer->start();
+
+    // Reconnect overlay (hidden by default)
+    m_reconnectOverlay = new QLabel(this);
+    m_reconnectOverlay->setAlignment(Qt::AlignCenter);
+    m_reconnectOverlay->setWordWrap(true);
+    m_reconnectOverlay->setStyleSheet(
+        QStringLiteral("QLabel { background-color: rgba(0, 0, 0, 180); color: white; "
+                        "font-size: 16px; padding: 40px; }"));
+    m_reconnectOverlay->hide();
 }
 
 SshSessionWidget::~SshSessionWidget()
@@ -96,12 +125,21 @@ void SshSessionWidget::setupVterm()
     m_vtermCallbacks = {};
     m_vtermCallbacks.damage = [](VTermRect rect, void *user) -> int {
         auto *self = static_cast<SshSessionWidget *>(user);
-        self->update();
+        self->renderCells(rect);
+        int x = rect.start_col * self->m_cellWidth;
+        int y = rect.start_row * self->m_cellHeight;
+        int w = (rect.end_col - rect.start_col) * self->m_cellWidth;
+        int h = (rect.end_row - rect.start_row) * self->m_cellHeight;
+        self->update(QRect(x, y, w, h));
         return 0;
     };
-    m_vtermCallbacks.movecursor = [](VTermPos, VTermPos, int, void *user) -> int {
+    m_vtermCallbacks.movecursor = [](VTermPos newPos, VTermPos oldPos, int, void *user) -> int {
         auto *self = static_cast<SshSessionWidget *>(user);
-        self->update();
+        // Invalidate old and new cursor positions
+        self->update(QRect(oldPos.col * self->m_cellWidth, oldPos.row * self->m_cellHeight,
+                           self->m_cellWidth, self->m_cellHeight));
+        self->update(QRect(newPos.col * self->m_cellWidth, newPos.row * self->m_cellHeight,
+                           self->m_cellWidth, self->m_cellHeight));
         return 0;
     };
     m_vtermCallbacks.bell = [](void *) -> int { return 0; };
@@ -130,7 +168,7 @@ void SshSessionWidget::onDataReceived(const QByteArray &data)
     if (m_vterm) {
         vterm_input_write(m_vterm, data.constData(), data.size());
         vterm_screen_flush_damage(m_vtermScreen);
-        update();
+        // No update() here — damage callback already issued targeted updates
     }
 }
 
@@ -139,6 +177,98 @@ void SshSessionWidget::calculateCellSize()
     QFontMetrics fm(m_font);
     m_cellWidth = fm.horizontalAdvance('M');
     m_cellHeight = fm.height();
+    m_fontAscent = fm.ascent();
+}
+
+void SshSessionWidget::initFontVariants()
+{
+    m_fontBold = m_font;
+    m_fontBold.setBold(true);
+
+    m_fontItalic = m_font;
+    m_fontItalic.setItalic(true);
+
+    m_fontBoldItalic = m_font;
+    m_fontBoldItalic.setBold(true);
+    m_fontBoldItalic.setItalic(true);
+
+    m_fontUnderline = m_font;
+    m_fontUnderline.setUnderline(true);
+
+    m_fontBoldUnderline = m_font;
+    m_fontBoldUnderline.setBold(true);
+    m_fontBoldUnderline.setUnderline(true);
+
+    m_fontStrike = m_font;
+    m_fontStrike.setStrikeOut(true);
+}
+
+const QFont &SshSessionWidget::fontForAttrs(unsigned bold, unsigned italic,
+                                             unsigned underline, unsigned strike) const
+{
+    if (strike) return m_fontStrike;
+    if (bold && italic) return m_fontBoldItalic;
+    if (bold && underline) return m_fontBoldUnderline;
+    if (bold) return m_fontBold;
+    if (italic) return m_fontItalic;
+    if (underline) return m_fontUnderline;
+    return m_font;
+}
+
+void SshSessionWidget::renderCells(const VTermRect &rect)
+{
+    if (m_backBuffer.isNull() || !m_vtermScreen)
+        return;
+
+    QPainter painter(&m_backBuffer);
+    painter.setFont(m_font);
+
+    for (int row = rect.start_row; row < rect.end_row; row++) {
+        int col = rect.start_col;
+        while (col < rect.end_col) {
+            VTermScreenCell cell;
+            VTermPos pos = {row, col};
+            vterm_screen_get_cell(m_vtermScreen, pos, &cell);
+
+            int cellWidth = cell.width > 0 ? cell.width : 1;
+            int x = col * m_cellWidth;
+            int y = row * m_cellHeight;
+
+            QColor bgColor = vtermColorToQColor(cell.bg);
+            QColor fgColor = vtermColorToQColor(cell.fg);
+            if (cell.attrs.reverse)
+                std::swap(bgColor, fgColor);
+
+            painter.fillRect(x, y, m_cellWidth * cellWidth, m_cellHeight, bgColor);
+
+            if (cell.chars[0] != 0) {
+                painter.setPen(fgColor);
+                const QFont &cellFont = fontForAttrs(cell.attrs.bold, cell.attrs.italic,
+                                                     cell.attrs.underline, cell.attrs.strike);
+                if (&cellFont != &m_font)
+                    painter.setFont(cellFont);
+
+                QString ch = QString::fromUcs4(&cell.chars[0], 1);
+                painter.drawText(x, y + m_fontAscent, ch);
+
+                if (&cellFont != &m_font)
+                    painter.setFont(m_font);
+            }
+
+            col += cellWidth;
+        }
+    }
+}
+
+void SshSessionWidget::renderAllCells()
+{
+    if (!m_vterm || !m_vtermScreen)
+        return;
+
+    int rows, cols;
+    vterm_get_size(m_vterm, &rows, &cols);
+    VTermRect full = {0, rows, 0, cols};
+    renderCells(full);
 }
 
 int SshSessionWidget::termCols() const
@@ -169,86 +299,61 @@ QColor SshSessionWidget::vtermColorToQColor(VTermColor color) const
 void SshSessionWidget::paintEvent(QPaintEvent *)
 {
     QPainter painter(this);
-    painter.fillRect(rect(), QColor(30, 30, 30));
 
-    if (!m_vterm || !m_vtermScreen)
+    if (m_backBuffer.isNull() || !m_vterm || !m_vtermScreen) {
+        painter.fillRect(rect(), QColor(30, 30, 30));
         return;
+    }
 
-    painter.setFont(m_font);
-    QFontMetrics fm(m_font);
-    int ascent = fm.ascent();
+    // Blit the back buffer (contains all cell content)
+    painter.drawPixmap(0, 0, m_backBuffer);
 
-    int rows, cols;
-    vterm_get_size(m_vterm, &rows, &cols);
-
-    VTermPos cursorPos;
-    vterm_state_get_cursorpos(vterm_obtain_state(m_vterm), &cursorPos);
-
-    // Normalize selection range for hit testing
-    VTermPos selMin = m_selStart, selMax = m_selEnd;
+    // Draw selection overlay on top
     if (m_hasSelection) {
+        int rows, cols;
+        vterm_get_size(m_vterm, &rows, &cols);
+
+        VTermPos selMin = m_selStart, selMax = m_selEnd;
         if (selMin.row > selMax.row || (selMin.row == selMax.row && selMin.col > selMax.col))
             std::swap(selMin, selMax);
-    }
 
-    for (int row = 0; row < rows; row++) {
-        for (int col = 0; col < cols; ) {
-            VTermScreenCell cell;
-            VTermPos pos = {row, col};
-            vterm_screen_get_cell(m_vtermScreen, pos, &cell);
+        int linearMin = selMin.row * cols + selMin.col;
+        int linearMax = selMax.row * cols + selMax.col;
 
-            int cellWidth = cell.width > 0 ? cell.width : 1;
-            int x = col * m_cellWidth;
-            int y = row * m_cellHeight;
+        for (int row = selMin.row; row <= selMax.row && row < rows; row++) {
+            int c0 = (row == selMin.row) ? selMin.col : 0;
+            int c1 = (row == selMax.row) ? selMax.col : cols - 1;
 
-            // Check if this cell is in the selection
-            bool selected = false;
-            if (m_hasSelection) {
+            for (int col = c0; col <= c1 && col < cols; col++) {
                 int linearPos = row * cols + col;
-                int linearMin = selMin.row * cols + selMin.col;
-                int linearMax = selMax.row * cols + selMax.col;
-                selected = (linearPos >= linearMin && linearPos <= linearMax);
+                if (linearPos < linearMin || linearPos > linearMax)
+                    continue;
+
+                int x = col * m_cellWidth;
+                int y = row * m_cellHeight;
+
+                painter.fillRect(x, y, m_cellWidth, m_cellHeight, QColor(58, 114, 196));
+
+                VTermScreenCell cell;
+                VTermPos pos = {row, col};
+                vterm_screen_get_cell(m_vtermScreen, pos, &cell);
+                if (cell.chars[0] != 0) {
+                    painter.setPen(QColor(255, 255, 255));
+                    const QFont &cellFont = fontForAttrs(cell.attrs.bold, cell.attrs.italic,
+                                                         cell.attrs.underline, cell.attrs.strike);
+                    painter.setFont(cellFont);
+                    QString ch = QString::fromUcs4(&cell.chars[0], 1);
+                    painter.drawText(x, y + m_fontAscent, ch);
+                }
             }
-
-            // Draw background
-            QColor bgColor = vtermColorToQColor(cell.bg);
-            QColor fgColor = vtermColorToQColor(cell.fg);
-            if (cell.attrs.reverse)
-                std::swap(bgColor, fgColor);
-            if (selected) {
-                bgColor = QColor(58, 114, 196);
-                fgColor = QColor(255, 255, 255);
-            }
-            painter.fillRect(x, y, m_cellWidth * cellWidth, m_cellHeight, bgColor);
-
-            // Draw character
-            if (cell.chars[0] != 0) {
-                painter.setPen(fgColor);
-
-                QFont cellFont = m_font;
-                if (cell.attrs.bold)
-                    cellFont.setBold(true);
-                if (cell.attrs.italic)
-                    cellFont.setItalic(true);
-                if (cell.attrs.underline)
-                    cellFont.setUnderline(true);
-                if (cell.attrs.strike)
-                    cellFont.setStrikeOut(true);
-                painter.setFont(cellFont);
-
-                QString ch = QString::fromUcs4(&cell.chars[0], 1);
-                painter.drawText(x, y + ascent, ch);
-
-                if (cellFont != m_font)
-                    painter.setFont(m_font);
-            }
-
-            col += cellWidth;
         }
+        painter.setFont(m_font);
     }
 
-    // Draw cursor
+    // Draw cursor on top
     if (m_cursorVisible && hasFocus()) {
+        VTermPos cursorPos;
+        vterm_state_get_cursorpos(vterm_obtain_state(m_vterm), &cursorPos);
         int cx = cursorPos.col * m_cellWidth;
         int cy = cursorPos.row * m_cellHeight;
         painter.fillRect(cx, cy, m_cellWidth, m_cellHeight, QColor(255, 255, 255, 128));
@@ -265,12 +370,9 @@ void SshSessionWidget::keyPressEvent(QKeyEvent *event)
         update();
     }
 
-    // Ctrl+V (Win) / Cmd+V (Mac) → paste clipboard into terminal
-#ifdef Q_OS_MACOS
-    bool isPaste = (event->modifiers() & Qt::MetaModifier) && event->key() == Qt::Key_V;
-#else
+    // Cmd+V (Mac) / Ctrl+V (Win) -> paste clipboard into terminal
+    // On macOS: Qt::ControlModifier = Cmd key; on Windows: Qt::ControlModifier = Ctrl key
     bool isPaste = (event->modifiers() & Qt::ControlModifier) && event->key() == Qt::Key_V;
-#endif
     if (isPaste) {
         QString text = QGuiApplication::clipboard()->text();
         if (!text.isEmpty()) {
@@ -285,10 +387,13 @@ void SshSessionWidget::keyPressEvent(QKeyEvent *event)
     auto qtMod = event->modifiers();
     if (qtMod & Qt::ShiftModifier)   mod = static_cast<VTermModifier>(mod | VTERM_MOD_SHIFT);
     if (qtMod & Qt::AltModifier)     mod = static_cast<VTermModifier>(mod | VTERM_MOD_ALT);
-    // On macOS, Qt::ControlModifier is the physical Ctrl key (correct for terminal).
-    // On Windows, Qt::ControlModifier is also the physical Ctrl key.
-    // Qt::MetaModifier is Cmd on macOS, Win key on Windows (not used for terminal).
+    // On macOS: Qt::MetaModifier = physical Ctrl key, Qt::ControlModifier = Cmd key.
+    // On Windows: Qt::ControlModifier = physical Ctrl key, Qt::MetaModifier = Win key.
+#ifdef Q_OS_MACOS
+    if (qtMod & Qt::MetaModifier)    mod = static_cast<VTermModifier>(mod | VTERM_MOD_CTRL);
+#else
     if (qtMod & Qt::ControlModifier) mod = static_cast<VTermModifier>(mod | VTERM_MOD_CTRL);
+#endif
 
     VTermKey vtKey = VTERM_KEY_NONE;
 
@@ -327,6 +432,14 @@ void SshSessionWidget::keyPressEvent(QKeyEvent *event)
         vterm_keyboard_key(m_vterm, vtKey, mod);
     } else {
         QString text = event->text();
+#ifdef Q_OS_MACOS
+        // On macOS, Meta+key (physical Ctrl) produces no text — synthesize the letter
+        if (text.isEmpty() && (mod & VTERM_MOD_CTRL) && event->key() >= Qt::Key_A && event->key() <= Qt::Key_Z) {
+            uint32_t letter = 'a' + (event->key() - Qt::Key_A);
+            vterm_keyboard_unichar(m_vterm, letter, mod);
+            return;
+        }
+#endif
         if (!text.isEmpty()) {
             uint32_t codepoint = text.at(0).unicode();
             vterm_keyboard_unichar(m_vterm, codepoint, mod);
@@ -337,6 +450,8 @@ void SshSessionWidget::keyPressEvent(QKeyEvent *event)
 void SshSessionWidget::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
+    if (m_reconnectOverlay && m_reconnectOverlay->isVisible())
+        m_reconnectOverlay->setGeometry(rect());
 
     int newCols = termCols();
     int newRows = termRows();
@@ -350,6 +465,11 @@ void SshSessionWidget::resizeEvent(QResizeEvent *event)
         }
         emit resizeRequested(m_cols, m_rows);
     }
+
+    // Recreate back buffer at new size and repaint all cells
+    m_backBuffer = QPixmap(width(), height());
+    m_backBuffer.fill(QColor(30, 30, 30));
+    renderAllCells();
 }
 
 VTermPos SshSessionWidget::pixelToCell(const QPoint &pos) const
@@ -426,6 +546,32 @@ QString SshSessionWidget::selectedText() const
     }
     return result;
 }
+
+// Claim all key events so Qt's shortcut system doesn't intercept
+// terminal keys like Ctrl+C, Ctrl+Z, Ctrl+A, etc.
+bool SshSessionWidget::event(QEvent *ev)
+{
+    if (ev->type() == QEvent::ShortcutOverride) {
+        ev->accept();
+        return true;
+    }
+#ifdef Q_OS_MACOS
+    // On macOS, physical Ctrl+key arrives as Meta+key.  Some of these
+    // (e.g. Meta+Z, Meta+X) may be swallowed by the QPA layer before
+    // keyPressEvent.  Intercept them here and forward to keyPressEvent.
+    if (ev->type() == QEvent::KeyPress) {
+        auto *ke = static_cast<QKeyEvent *>(ev);
+        if ((ke->modifiers() & Qt::MetaModifier) &&
+            ke->key() >= Qt::Key_A && ke->key() <= Qt::Key_Z)
+        {
+            keyPressEvent(ke);
+            return true;
+        }
+    }
+#endif
+    return QWidget::event(ev);
+}
+
 
 // Prevent Qt from consuming Tab for focus navigation
 bool SshSessionWidget::focusNextPrevChild(bool /*next*/)

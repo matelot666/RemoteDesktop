@@ -36,6 +36,9 @@ public:
     bool rdpFontSmoothing() const;
     void setRdpFontSmoothing(bool enabled);
 
+    bool rdpVerboseLog() const;
+    void setRdpVerboseLog(bool enabled);
+
 private:
     QSettings *m_settings = nullptr;
     QString m_configDir;

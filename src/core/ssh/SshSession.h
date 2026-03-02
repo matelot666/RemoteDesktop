@@ -36,11 +36,16 @@ signals:
     void connected();
     void disconnected();
     void errorOccurred(const QString &message);
+    void reconnectStatus(const QString &message);
     void dataReceived(const QByteArray &data);
 
 private:
     void readLoop();
     void cleanup();
+    void forceCleanup();
+    bool reconnect();
+    void setTcpKeepalive();
+    int waitsocket();
     bool connectTcp();
     bool performHandshake();
     bool authenticate();

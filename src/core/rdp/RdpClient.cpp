@@ -122,6 +122,10 @@ BOOL rdp_desktop_resize(rdpContext *context)
     return TRUE;
 }
 
+// Forward declaration — defined below with PubSub handlers
+UINT rdp_gfx_caps_confirm(RdpgfxClientContext *gfx,
+                           const RDPGFX_CAPS_CONFIRM_PDU *capsConfirm);
+
 BOOL rdp_post_connect(freerdp *instance)
 {
     auto *ctx = reinterpret_cast<RdpCustomContext *>(instance->context);
@@ -129,15 +133,26 @@ BOOL rdp_post_connect(freerdp *instance)
     if (!gdi_init(instance, PIXEL_FORMAT_BGRA32))
         return FALSE;
 
-    rdpGdi *gdi = instance->context->gdi;
-
-    ctx->session->onPostConnect(gdi->width, gdi->height,
-                                gdi->primary_buffer, gdi->stride);
-
-    // Set update callbacks
+    // Set update callbacks IMMEDIATELY after gdi_init — gdi_ResetGraphics
+    // (called by the GFX pipeline's DRDYNVC thread) asserts DesktopResize
+    // is non-NULL.  gdi_init() does NOT set it, so we must do it before
+    // anything else that could let the GFX thread fire.
     rdpUpdate *update = instance->context->update;
     update->EndPaint = rdp_end_paint;
     update->DesktopResize = rdp_desktop_resize;
+
+    // If RDPGFX channel connected before post_connect (race with DRDYNVC thread),
+    // initialize the GFX pipeline now that GDI and DesktopResize are ready.
+    if (ctx->pendingGfx) {
+        auto *gfx = static_cast<RdpgfxClientContext *>(ctx->pendingGfx);
+        gdi_graphics_pipeline_init(instance->context->gdi, gfx);
+        gfx->CapsConfirm = rdp_gfx_caps_confirm;
+        ctx->pendingGfx = nullptr;
+    }
+
+    rdpGdi *gdi = instance->context->gdi;
+    ctx->session->onPostConnect(gdi->width, gdi->height,
+                                gdi->primary_buffer, gdi->stride);
 
     return TRUE;
 }
@@ -439,6 +454,26 @@ UINT rdp_cliprdr_server_file_contents_request(CliprdrClientContext *cliprdr,
     return CHANNEL_RC_OK;
 }
 
+// ── GFX caps confirm callback ────────────────────────────────────────
+
+UINT rdp_gfx_caps_confirm(RdpgfxClientContext *gfx,
+                           const RDPGFX_CAPS_CONFIRM_PDU *capsConfirm)
+{
+    if (!gfx || !gfx->custom || !capsConfirm)
+        return CHANNEL_RC_OK;
+
+    // gdi_graphics_pipeline_init sets gfx->custom = gdi
+    auto *gdi = static_cast<rdpGdi *>(gfx->custom);
+    if (!gdi || !gdi->context)
+        return CHANNEL_RC_OK;
+
+    auto *ctx = reinterpret_cast<RdpCustomContext *>(gdi->context);
+    if (ctx && ctx->session)
+        ctx->session->setGfxCapsConfirm(capsConfirm->capsSet->version,
+                                         capsConfirm->capsSet->flags);
+    return CHANNEL_RC_OK;
+}
+
 // ── PubSub channel event handlers ───────────────────────────────────
 
 void rdp_on_channel_connected(void *context, const ChannelConnectedEventArgs *e)
@@ -462,9 +497,20 @@ void rdp_on_channel_connected(void *context, const ChannelConnectedEventArgs *e)
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && e->pInterface) {
         auto *gfx = static_cast<RdpgfxClientContext *>(e->pInterface);
+        ctx->session->setGfxChannelActive(true);
         rdpGdi *gdi = ctx->context.gdi;
-        gdi_graphics_pipeline_init(gdi, gfx);
+        if (gdi && ctx->context.update && ctx->context.update->DesktopResize) {
+            // GDI and DesktopResize ready — init pipeline now
+            gdi_graphics_pipeline_init(gdi, gfx);
+            gfx->CapsConfirm = rdp_gfx_caps_confirm;
+        } else {
+            // GDI not ready yet — defer to rdp_post_connect
+            ctx->pendingGfx = gfx;
+        }
     }
+
+    if (strcmp(e->name, "drdynvc") == 0)
+        ctx->session->setDrdynvcActive(true);
 }
 
 void rdp_on_channel_disconnected(void *context, const ChannelDisconnectedEventArgs *e)
@@ -477,10 +523,20 @@ void rdp_on_channel_disconnected(void *context, const ChannelDisconnectedEventAr
         ctx->session->setCliprdrContext(nullptr);
     }
     else if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && e->pInterface) {
+        ctx->session->setGfxChannelActive(false);
         auto *gfx = static_cast<RdpgfxClientContext *>(e->pInterface);
-        rdpGdi *gdi = ctx->context.gdi;
-        gdi_graphics_pipeline_uninit(gdi, gfx);
+        if (ctx->pendingGfx == gfx) {
+            // Pipeline was never initialized (deferred init, connection failed)
+            ctx->pendingGfx = nullptr;
+        } else {
+            rdpGdi *gdi = ctx->context.gdi;
+            if (gdi)
+                gdi_graphics_pipeline_uninit(gdi, gfx);
+        }
     }
+
+    if (strcmp(e->name, "drdynvc") == 0)
+        ctx->session->setDrdynvcActive(false);
 }
 
 } // extern "C"
@@ -515,7 +571,7 @@ static const RdpScancode s_macToRdp[128] = {
     {0x2D, false}, // 0x07 kVK_ANSI_X
     {0x2E, false}, // 0x08 kVK_ANSI_C
     {0x2F, false}, // 0x09 kVK_ANSI_V
-    {0x56, false}, // 0x0A kVK_ISO_Section
+    {0x2B, false}, // 0x0A kVK_ISO_Section → OEM_5 (# on UK PC, next to left shift on ISO Mac)
     {0x30, false}, // 0x0B kVK_ANSI_B
     {0x10, false}, // 0x0C kVK_ANSI_Q
     {0x11, false}, // 0x0D kVK_ANSI_W
@@ -547,7 +603,7 @@ static const RdpScancode s_macToRdp[128] = {
     {0x28, false}, // 0x27 kVK_ANSI_Quote
     {0x25, false}, // 0x28 kVK_ANSI_K
     {0x27, false}, // 0x29 kVK_ANSI_Semicolon
-    {0x2B, false}, // 0x2A kVK_ANSI_Backslash
+    {0x56, false}, // 0x2A kVK_ANSI_Backslash → OEM_102 (\ on UK PC, between ' and Enter on ISO Mac)
     {0x33, false}, // 0x2B kVK_ANSI_Comma
     {0x35, false}, // 0x2C kVK_ANSI_Slash
     {0x31, false}, // 0x2D kVK_ANSI_N

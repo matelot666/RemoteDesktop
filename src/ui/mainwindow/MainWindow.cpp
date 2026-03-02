@@ -10,9 +10,15 @@
 #include <QKeySequence>
 #include <QApplication>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QCheckBox>
+#include <QTimer>
 #include "ui/dialogs/CredentialManagerDialog.h"
+#include "ui/dialogs/SessionInfoDialog.h"
+#include "ui/dialogs/QuickConnectDialog.h"
+#include "ui/sessionview/RdpSessionWidget.h"
+#include "ui/sessionview/SshSessionWidget.h"
 #include "core/importexport/DevolutionsImporter.h"
 #include "core/importexport/ConnectionExporter.h"
 #include "app/Application.h"
@@ -20,6 +26,8 @@
 #include "core/connectiondb/ConnectionDatabase.h"
 #include "core/userdb/UserDatabase.h"
 #include "core/config/ConfigManager.h"
+
+qint64 MainWindow::s_nextQuickConnectId = -1000;
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -33,6 +41,16 @@ MainWindow::MainWindow(QWidget *parent)
         title += QStringLiteral(" (Admin)");
     setWindowTitle(title);
     resize(1400, 900);
+
+    // Poll shared DB for external changes every 30 seconds
+    QString dbPath = Application::instance()->databasePath();
+    if (!dbPath.isEmpty()) {
+        m_lastDbModified = QFileInfo(dbPath).lastModified();
+        m_dbPollTimer = new QTimer(this);
+        m_dbPollTimer->setInterval(30000);
+        connect(m_dbPollTimer, &QTimer::timeout, this, &MainWindow::checkSharedDbChanged);
+        m_dbPollTimer->start();
+    }
 }
 
 void MainWindow::setupUi()
@@ -50,6 +68,8 @@ void MainWindow::setupUi()
     m_searchBox->setPlaceholderText(QStringLiteral("Search..."));
     m_searchBox->setClearButtonEnabled(true);
     leftLayout->addWidget(m_searchBox);
+
+    connect(m_searchBox, &QLineEdit::textChanged, this, &MainWindow::filterTree);
 
     m_treeModel = new ConnectionTreeModel(this);
     m_treeView = new ConnectionTreeView;
@@ -89,6 +109,9 @@ void MainWindow::setupMenuBar()
     bool admin = Application::instance()->isAdmin();
 
     auto *fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
+    fileMenu->addAction(QStringLiteral("&Quick Connect..."), this, &MainWindow::quickConnect,
+                        QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Q));
+    fileMenu->addSeparator();
     fileMenu->addAction(QStringLiteral("Manage &Credentials..."), this, [this]() {
         CredentialManagerDialog dlg(this);
         dlg.exec();
@@ -157,6 +180,9 @@ void MainWindow::setupMenuBar()
                         QKeySequence::Quit);
 
     auto *viewMenu = menuBar()->addMenu(QStringLiteral("&View"));
+    viewMenu->addAction(QStringLiteral("&Refresh"), this, &MainWindow::refreshTree,
+                        QKeySequence(Qt::Key_F5));
+    viewMenu->addSeparator();
     viewMenu->addAction(QStringLiteral("Toggle &Sidebar"),
                         this, &MainWindow::toggleLeftPanel,
                         QKeySequence(Qt::CTRL | Qt::Key_B));
@@ -210,6 +236,31 @@ void MainWindow::setupMenuBar()
         cfg->setRdpFontSmoothing(checked);
         cfg->save();
     });
+
+    rdpMenu->addSeparator();
+
+    auto *actVerboseLog = rdpMenu->addAction(QStringLiteral("Verbose FreeRDP Logging"));
+    actVerboseLog->setCheckable(true);
+    actVerboseLog->setChecked(cfg->rdpVerboseLog());
+    actVerboseLog->setToolTip(QStringLiteral("Enable detailed FreeRDP protocol logging to stderr (for debugging)"));
+    connect(actVerboseLog, &QAction::toggled, this, [cfg](bool checked) {
+        cfg->setRdpVerboseLog(checked);
+        cfg->save();
+    });
+
+    // ── Help menu ──
+    auto *helpMenu = menuBar()->addMenu(QStringLiteral("&Help"));
+    helpMenu->addAction(QStringLiteral("Session Info..."), this, [this]() {
+        QWidget *current = m_tabWidget->currentWidget();
+        auto *rdpWidget = qobject_cast<RdpSessionWidget *>(current);
+        if (!rdpWidget || !rdpWidget->rdpSession()) {
+            QMessageBox::information(this, QStringLiteral("Session Info"),
+                                     QStringLiteral("No active RDP session selected."));
+            return;
+        }
+        SessionInfoDialog dlg(rdpWidget->rdpSession(), this);
+        dlg.exec();
+    });
 }
 
 void MainWindow::setupShortcuts()
@@ -247,6 +298,64 @@ void MainWindow::toggleLeftPanel()
     m_leftPanel->setVisible(m_leftPanelVisible);
 }
 
+void MainWindow::quickConnect()
+{
+    QuickConnectDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    ConnectionEntry entry = dlg.connectionEntry();
+    qint64 quickId = s_nextQuickConnectId--;
+    entry.id = quickId;
+
+    QString username = dlg.username();
+    QString password = dlg.password();
+    QString privateKey = dlg.privateKey();
+
+    // Tab label: hostname, or hostname:port if non-default
+    QString tabLabel = entry.hostname;
+    if (entry.port != entry.defaultPort())
+        tabLabel += QStringLiteral(":%1").arg(entry.port);
+
+    if (entry.protocol == Protocol::RDP) {
+        auto *widget = new RdpSessionWidget(entry, username, password);
+
+        connect(widget, &RdpSessionWidget::sessionDisconnected, this, [this, quickId]() {
+            m_tabWidget->removeSessionTab(quickId);
+            updateStatusBar();
+        });
+        connect(widget, &RdpSessionWidget::sessionError, this, [this, quickId](const QString &msg) {
+            QMessageBox::warning(this, QStringLiteral("RDP Error"), msg);
+            QTimer::singleShot(2000, this, [this, quickId]() {
+                m_tabWidget->removeSessionTab(quickId);
+                updateStatusBar();
+            });
+        });
+
+        m_tabWidget->addSessionTab(widget, tabLabel, quickId);
+        widget->connectSession();
+    } else {
+        auto *widget = new SshSessionWidget(entry, username, password, privateKey);
+
+        connect(widget, &SshSessionWidget::sessionDisconnected, this, [this, quickId]() {
+            m_tabWidget->removeSessionTab(quickId);
+            updateStatusBar();
+        });
+        connect(widget, &SshSessionWidget::sessionError, this, [this, quickId](const QString &msg) {
+            QMessageBox::warning(this, QStringLiteral("SSH Error"), msg);
+            QTimer::singleShot(2000, this, [this, quickId]() {
+                m_tabWidget->removeSessionTab(quickId);
+                updateStatusBar();
+            });
+        });
+
+        m_tabWidget->addSessionTab(widget, tabLabel, quickId);
+        widget->connectSession();
+    }
+
+    updateStatusBar();
+}
+
 void MainWindow::updateStatusBar()
 {
     int count = m_tabWidget->activeSessionCount();
@@ -256,5 +365,104 @@ void MainWindow::updateStatusBar()
         m_statusLabel->setText(QStringLiteral("Connected: %1 session%2")
                                    .arg(count)
                                    .arg(count != 1 ? "s" : ""));
+    }
+}
+
+void MainWindow::refreshTree()
+{
+    auto expanded = m_treeView->saveExpandedFolderIds();
+    m_treeModel->loadFromDatabase();
+    m_treeView->restoreExpandedFolderIds(expanded);
+    // Update last-modified so the poll timer doesn't immediately reload again
+    QString dbPath = Application::instance()->databasePath();
+    if (!dbPath.isEmpty())
+        m_lastDbModified = QFileInfo(dbPath).lastModified();
+    // Re-apply search filter if active
+    if (!m_searchBox->text().isEmpty())
+        filterTree(m_searchBox->text());
+}
+
+void MainWindow::checkSharedDbChanged()
+{
+    QString dbPath = Application::instance()->databasePath();
+    if (dbPath.isEmpty())
+        return;
+    QDateTime mod = QFileInfo(dbPath).lastModified();
+    if (mod != m_lastDbModified) {
+        m_lastDbModified = mod;
+        auto expanded = m_treeView->saveExpandedFolderIds();
+        m_treeModel->loadFromDatabase();
+        m_treeView->restoreExpandedFolderIds(expanded);
+        // Re-apply search filter if active
+        if (!m_searchBox->text().isEmpty())
+            filterTree(m_searchBox->text());
+    }
+}
+
+void MainWindow::filterTree(const QString &text)
+{
+    if (text.isEmpty()) {
+        clearTreeFilter(QModelIndex());
+        return;
+    }
+
+    filterTreeRecursive(QModelIndex(), text);
+
+    // Expand all visible folders so matches are visible
+    std::function<void(const QModelIndex &)> expandVisible =
+        [&](const QModelIndex &parent) {
+            int rows = m_treeModel->rowCount(parent);
+            for (int i = 0; i < rows; ++i) {
+                QModelIndex idx = m_treeModel->index(i, 0, parent);
+                if (!m_treeView->isRowHidden(i, parent)) {
+                    auto *item = m_treeModel->itemFromIndex(idx);
+                    if (item && item->nodeType() == TreeNodeType::Folder) {
+                        m_treeView->setExpanded(idx, true);
+                        expandVisible(idx);
+                    }
+                }
+            }
+        };
+    expandVisible(QModelIndex());
+}
+
+bool MainWindow::filterTreeRecursive(const QModelIndex &parent, const QString &text)
+{
+    int rows = m_treeModel->rowCount(parent);
+    bool anyChildVisible = false;
+
+    for (int i = 0; i < rows; ++i) {
+        QModelIndex idx = m_treeModel->index(i, 0, parent);
+        auto *item = m_treeModel->itemFromIndex(idx);
+        if (!item) {
+            m_treeView->setRowHidden(i, parent, true);
+            continue;
+        }
+
+        bool nameMatches = item->name().contains(text, Qt::CaseInsensitive);
+        bool descendantMatches = false;
+
+        if (item->nodeType() == TreeNodeType::Folder)
+            descendantMatches = filterTreeRecursive(idx, text);
+
+        bool visible = nameMatches || descendantMatches;
+        m_treeView->setRowHidden(i, parent, !visible);
+
+        if (visible)
+            anyChildVisible = true;
+    }
+
+    return anyChildVisible;
+}
+
+void MainWindow::clearTreeFilter(const QModelIndex &parent)
+{
+    int rows = m_treeModel->rowCount(parent);
+    for (int i = 0; i < rows; ++i) {
+        m_treeView->setRowHidden(i, parent, false);
+        QModelIndex idx = m_treeModel->index(i, 0, parent);
+        auto *item = m_treeModel->itemFromIndex(idx);
+        if (item && item->nodeType() == TreeNodeType::Folder)
+            clearTreeFilter(idx);
     }
 }

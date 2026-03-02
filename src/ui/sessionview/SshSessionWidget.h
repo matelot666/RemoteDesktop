@@ -3,7 +3,9 @@
 #include <QWidget>
 #include <QThread>
 #include <QFont>
+#include <QLabel>
 #include <QTimer>
+#include <QPixmap>
 #ifdef _WIN32
 // Windows SDK rpcndr.h defines 'small' as a macro for 'char',
 // which collides with libvterm's VTermScreenCellAttrs::small bitfield.
@@ -38,6 +40,7 @@ signals:
     void resizeRequested(int cols, int rows);
 
 protected:
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
@@ -56,6 +59,10 @@ private:
     void destroyVterm();
     QColor vtermColorToQColor(VTermColor color) const;
     void calculateCellSize();
+    void initFontVariants();
+    const QFont &fontForAttrs(unsigned bold, unsigned italic, unsigned underline, unsigned strike) const;
+    void renderCells(const VTermRect &rect);
+    void renderAllCells();
     int termCols() const;
     int termRows() const;
 
@@ -69,9 +76,21 @@ private:
     VTerm *m_vterm = nullptr;
     VTermScreen *m_vtermScreen = nullptr;
 
+    // Back buffer — only damaged cells are repainted into this pixmap
+    QPixmap m_backBuffer;
+
+    // Font variants (cached to avoid per-cell QFont construction)
     QFont m_font;
+    QFont m_fontBold;
+    QFont m_fontItalic;
+    QFont m_fontBoldItalic;
+    QFont m_fontUnderline;
+    QFont m_fontBoldUnderline;
+    QFont m_fontStrike;
+
     int m_cellWidth = 0;
     int m_cellHeight = 0;
+    int m_fontAscent = 0;
     int m_cols = 80;
     int m_rows = 24;
 
@@ -81,6 +100,7 @@ private:
     // Text selection (terminal coordinates)
     VTermPos pixelToCell(const QPoint &pos) const;
     QString selectedText() const;
+    QLabel *m_reconnectOverlay = nullptr;
     bool m_selecting = false;
     bool m_hasSelection = false;
     VTermPos m_selStart = {0, 0};

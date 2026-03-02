@@ -30,7 +30,13 @@ ssh "$HOST" "$QT_DIR/bin/windeployqt.exe $RELEASE_DIR/RemoteDesktop.exe"
 
 echo "==> Copying runtime DLLs into Release dir..."
 ssh "$HOST" "robocopy C:\freerdp\bin $RELEASE_DIR *.dll /NP /NFL /NDL" || true
-ssh "$HOST" "robocopy $VCPKG_BIN $RELEASE_DIR libssh2.dll libssl-3-x64.dll libcrypto-3-x64.dll zlib1.dll /NP /NFL /NDL" || true
+ssh "$HOST" "robocopy $VCPKG_BIN $RELEASE_DIR libssh2.dll libssl-3-x64.dll libcrypto-3-x64.dll zlib1.dll openh264-7.dll swscale-9.dll avutil-60.dll legacy.dll /NP /NFL /NDL" || true
+
+echo "==> Removing unnecessary files from Release dir..."
+ssh "$HOST" "cd /d $RELEASE_DIR && del /q Qt6Network.dll D3Dcompiler_47.dll opengl32sw.dll concrt140.dll msvcp140_1.dll msvcp140_2.dll msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll 2>nul"
+ssh "$HOST" "cd /d $RELEASE_DIR && rmdir /s /q generic networkinformation tls translations 2>nul"
+ssh "$HOST" "cd /d $RELEASE_DIR\imageformats && del /q qgif.dll qico.dll qjpeg.dll 2>nul"
+ssh "$HOST" "cd /d $RELEASE_DIR\sqldrivers && del /q qsqlmimer.dll qsqlodbc.dll qsqlpsql.dll 2>nul"
 
 echo "==> Installing to $INSTALL_DIR..."
 ssh "$HOST" "robocopy $RELEASE_DIR \"$INSTALL_DIR\" /MIR /NP /NFL /NDL" || true

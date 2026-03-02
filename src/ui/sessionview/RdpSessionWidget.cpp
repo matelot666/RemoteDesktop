@@ -13,6 +13,7 @@
 #include <QClipboard>
 #include <QMimeData>
 #include <QUrl>
+#include <QFileInfo>
 #include "app/Application.h"
 #include "core/config/ConfigManager.h"
 
@@ -42,6 +43,27 @@ RdpSessionWidget::RdpSessionWidget(const ConnectionEntry &entry,
         emit sessionDisconnected();
     });
     connect(m_session, &RdpSession::errorOccurred, this, &RdpSessionWidget::sessionError);
+    connect(m_session, &RdpSession::reconnectStatus, this, [this](const QString &msg) {
+        if (msg.isEmpty()) {
+            m_reconnectOverlay->hide();
+            m_renderTimer->start();
+        } else {
+            m_renderTimer->stop();
+            m_reconnectOverlay->setText(msg);
+            m_reconnectOverlay->setGeometry(rect());
+            m_reconnectOverlay->show();
+            m_reconnectOverlay->raise();
+        }
+    });
+
+    // Reconnect overlay (hidden by default)
+    m_reconnectOverlay = new QLabel(this);
+    m_reconnectOverlay->setAlignment(Qt::AlignCenter);
+    m_reconnectOverlay->setWordWrap(true);
+    m_reconnectOverlay->setStyleSheet(
+        QStringLiteral("QLabel { background-color: rgba(0, 0, 0, 180); color: white; "
+                        "font-size: 16px; padding: 40px; }"));
+    m_reconnectOverlay->hide();
 
     // Poll the session framebuffer at ~60fps instead of reacting to per-rect signals.
     // This avoids signal queue flooding when FreeRDP fires many EndPaint callbacks
@@ -55,13 +77,20 @@ RdpSessionWidget::RdpSessionWidget(const ConnectionEntry &entry,
 
     // Clipboard: remote → local
     if (m_entry.enableClipboard) {
-        connect(m_session, &RdpSession::remoteClipboardChanged, this, [](const QString &text) {
+        connect(m_session, &RdpSession::remoteClipboardChanged, this, [this](const QString &text) {
             QClipboard *clipboard = QGuiApplication::clipboard();
-            if (clipboard)
+            if (clipboard) {
+                m_suppressClipboardEcho = true;
                 clipboard->setText(text);
+#ifdef Q_OS_MACOS
+                // Update poll signature so the timer doesn't re-announce this change
+                m_lastClipboardSignature = {QStringLiteral("text:") + text.left(256)};
+#endif
+            }
         }, Qt::QueuedConnection);
 
-        connect(m_session, &RdpSession::remoteFilesReceived, this, [](const QStringList &paths) {
+        connect(m_session, &RdpSession::remoteFilesReceived, this,
+                [this](const QStringList &paths, const QString &originalText) {
             QClipboard *clipboard = QGuiApplication::clipboard();
             if (!clipboard)
                 return;
@@ -70,7 +99,24 @@ RdpSessionWidget::RdpSessionWidget(const ConnectionEntry &entry,
             for (const QString &path : paths)
                 urls.append(QUrl::fromLocalFile(path));
             mimeData->setUrls(urls);
+            // Use original remote text if available (e.g. UNC paths), otherwise filenames
+            if (!originalText.isEmpty()) {
+                mimeData->setText(originalText);
+            } else {
+                QStringList names;
+                for (const QString &path : paths)
+                    names.append(QFileInfo(path).fileName());
+                mimeData->setText(names.join(QStringLiteral("\n")));
+            }
+            m_suppressClipboardEcho = true;
             clipboard->setMimeData(mimeData);
+#ifdef Q_OS_MACOS
+            // Update poll signature so the timer doesn't re-announce this change
+            QStringList sig;
+            for (const QUrl &url : urls)
+                sig.append(url.toString());
+            m_lastClipboardSignature = sig;
+#endif
         }, Qt::QueuedConnection);
 
         // Clipboard: local → remote
@@ -78,6 +124,11 @@ RdpSessionWidget::RdpSessionWidget(const ConnectionEntry &entry,
         auto clipboardChanged = [this]() {
             if (!m_session)
                 return;
+            // Skip if this change was caused by us receiving data from the remote
+            if (m_suppressClipboardEcho) {
+                m_suppressClipboardEcho = false;
+                return;
+            }
             QClipboard *cb = QGuiApplication::clipboard();
             if (!cb)
                 return;
@@ -162,6 +213,7 @@ void RdpSessionWidget::connectSession()
         opts.h264 = cfg->rdpH264();
         opts.remoteFx = cfg->rdpRemoteFx();
         opts.fontSmoothing = cfg->rdpFontSmoothing();
+        opts.verboseLog = cfg->rdpVerboseLog();
         m_session->setRdpOptions(opts);
         m_workerThread->start();
     });
@@ -392,6 +444,12 @@ void RdpSessionWidget::keyPressEvent(QKeyEvent *event)
     if (!m_session)
         return;
 
+    // Filter Qt auto-repeat: RDP server handles key repeat internally.
+    // Without this, the GFX pipeline's faster event loop causes auto-repeat
+    // key-downs to flood the server at an excessive rate.
+    if (event->isAutoRepeat())
+        return;
+
     event->accept(); // Prevent Qt from handling (e.g. Tab focus navigation)
 
 #ifdef Q_OS_MACOS
@@ -511,6 +569,8 @@ void RdpSessionWidget::keyReleaseEvent(QKeyEvent *event)
 void RdpSessionWidget::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
+    if (m_reconnectOverlay && m_reconnectOverlay->isVisible())
+        m_reconnectOverlay->setGeometry(rect());
     if (!m_displayBuffer.isNull()) {
         double scaleX = static_cast<double>(width()) / m_displayBuffer.width();
         double scaleY = static_cast<double>(height()) / m_displayBuffer.height();

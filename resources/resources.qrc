@@ -10,5 +10,6 @@
         <file>icons/ssh-connected.svg</file>
         <file>icons/ssh-error.svg</file>
         <file>icons/appicon/appicon.png</file>
+        <file>icons/nobs-rdp-logo.svg</file>
     </qresource>
 </RCC>

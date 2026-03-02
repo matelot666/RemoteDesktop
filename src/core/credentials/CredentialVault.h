@@ -32,6 +32,14 @@ public:
     // Check if vault has been set up (salt exists)
     bool hasBeenSetup() const;
 
+    // Async unlock support — separates CPU-intensive PBKDF2 from DB I/O
+    // so callers can run pbkdf2Derive() on a background thread while
+    // keeping all DB access on the main thread.
+    QByteArray readSalt() const;
+    static QByteArray pbkdf2Derive(const QString &password, const QByteArray &salt);
+    bool completeUnlock(const QByteArray &derivedKey);
+    bool completeSetup(const QByteArray &derivedKey);
+
 signals:
     void lockedChanged(bool locked);
 

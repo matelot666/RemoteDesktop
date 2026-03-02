@@ -3,6 +3,7 @@
 #include <QTreeView>
 #include <QSet>
 
+class QTimer;
 class ConnectionTreeModel;
 class TreeItem;
 
@@ -37,11 +38,17 @@ private:
     void outdentFolder(const QModelIndex &index);
     int countConnectionsUnder(TreeItem *item) const;
     int countConnectedUnder(TreeItem *item) const;
+    void flashRow(const QModelIndex &index);
 
-    QSet<qint64> saveExpandedFolderIds() const;
-    void restoreExpandedFolderIds(const QSet<qint64> &ids);
     void collectExpandedIds(const QModelIndex &parent, QSet<qint64> &ids) const;
     void restoreExpandedIds(const QModelIndex &parent, const QSet<qint64> &ids);
 
+public:
+    QSet<qint64> saveExpandedFolderIds() const;
+    void restoreExpandedFolderIds(const QSet<qint64> &ids);
+
     ConnectionTreeModel *m_model = nullptr;
+    QPersistentModelIndex m_flashIndex;
+    int m_flashStep = 0;
+    QTimer *m_flashTimer = nullptr;
 };

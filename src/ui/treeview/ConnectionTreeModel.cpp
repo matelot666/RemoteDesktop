@@ -236,6 +236,10 @@ bool ConnectionTreeModel::isDescendantOf(TreeItem *item, TreeItem *potentialAnce
 
 void ConnectionTreeModel::loadFromDatabase()
 {
+    auto *db = Application::instance()->database();
+    if (!db)
+        return;
+
     // Pre-load user DB overlays
     auto *userDb = Application::instance()->userDatabase();
     if (userDb) {
@@ -246,38 +250,53 @@ void ConnectionTreeModel::loadFromDatabase()
         m_folderDefaults.clear();
     }
 
+    // Fetch ALL folders and connections in 2 queries (instead of 2 per folder)
+    auto allFolders = db->allFolders();
+    auto allConns = db->allConnections();
+
+    // Group by parent/folder and apply user DB overlays
+    QHash<qint64, QVector<ConnectionFolder>> foldersByParent;
+    for (auto &f : allFolders) {
+        if (m_folderDefaults.contains(f.id)) {
+            const auto &fd = m_folderDefaults[f.id];
+            f.defaultRdpCredentialId = fd.defaultRdpCredentialId;
+            f.defaultSshCredentialId = fd.defaultSshCredentialId;
+        }
+        foldersByParent[f.parentId].append(f);
+    }
+
+    QHash<qint64, QVector<ConnectionEntry>> connsByFolder;
+    for (auto &c : allConns) {
+        if (m_credentialAssignments.contains(c.id))
+            c.credentialId = m_credentialAssignments[c.id];
+        connsByFolder[c.folderId].append(c);
+    }
+
     beginResetModel();
     m_rootItem->removeAllChildren();
-    buildTreeRecursive(m_rootItem, -1);
+    buildTreeFromMaps(m_rootItem, -1, foldersByParent, connsByFolder);
     endResetModel();
 }
 
-void ConnectionTreeModel::buildTreeRecursive(TreeItem *parentItem, qint64 parentFolderId)
+void ConnectionTreeModel::buildTreeFromMaps(
+    TreeItem *parentItem, qint64 parentFolderId,
+    const QHash<qint64, QVector<ConnectionFolder>> &foldersByParent,
+    const QHash<qint64, QVector<ConnectionEntry>> &connsByFolder)
 {
-    auto *db = Application::instance()->database();
-    if (!db)
-        return;
-
-    auto folders = db->foldersInParent(parentFolderId);
-    for (auto &folder : folders) {
-        // Overlay user DB folder defaults
-        if (m_folderDefaults.contains(folder.id)) {
-            const auto &fd = m_folderDefaults[folder.id];
-            folder.defaultRdpCredentialId = fd.defaultRdpCredentialId;
-            folder.defaultSshCredentialId = fd.defaultSshCredentialId;
+    auto folderIt = foldersByParent.find(parentFolderId);
+    if (folderIt != foldersByParent.end()) {
+        for (const auto &folder : *folderIt) {
+            auto *folderItem = new TreeItem(folder);
+            parentItem->appendChild(folderItem);
+            buildTreeFromMaps(folderItem, folder.id, foldersByParent, connsByFolder);
         }
-        auto *folderItem = new TreeItem(folder);
-        parentItem->appendChild(folderItem);
-        buildTreeRecursive(folderItem, folder.id);
     }
 
-    auto connections = db->connectionsInFolder(parentFolderId);
-    for (auto &conn : connections) {
-        // Overlay user DB credential assignment
-        if (m_credentialAssignments.contains(conn.id)) {
-            conn.credentialId = m_credentialAssignments[conn.id];
+    auto connIt = connsByFolder.find(parentFolderId);
+    if (connIt != connsByFolder.end()) {
+        for (const auto &conn : *connIt) {
+            parentItem->appendChild(new TreeItem(conn));
         }
-        parentItem->appendChild(new TreeItem(conn));
     }
 }
 

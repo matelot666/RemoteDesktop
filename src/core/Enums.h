@@ -19,6 +19,13 @@ enum class CredentialType : int {
     PrivateKey = 1
 };
 
+enum class RdpSecurity : int {
+    Auto = 0,   // NLA + TLS + RDP (let server choose)
+    NLA  = 1,   // NLA/CredSSP only
+    TLS  = 2,   // TLS only (recommended for xrdp)
+    RDP  = 3    // Legacy RDP security only
+};
+
 enum class TreeNodeType : int {
     Folder = 0,
     Connection = 1

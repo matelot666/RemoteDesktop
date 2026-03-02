@@ -8,8 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
-rm -rf /Applications/RemoteDesktop.app && cp -R build/RemoteDesktop.app /Applications/RemoteDesktop.app  # deploy
-./build/RemoteDesktop.app/Contents/MacOS/RemoteDesktop           # run
+./build/RemoteDesktop.app/Contents/MacOS/RemoteDesktop           # run (dev, uses Homebrew dylibs)
+
+# Full deploy (rebuilds, bundles all dylibs, installs to /Applications):
+./deploy-macos.sh
+
+# The .app is self-contained — no Homebrew needed on target Mac
 ```
 
 ### Windows (cross-build via SSH to jumpbox)

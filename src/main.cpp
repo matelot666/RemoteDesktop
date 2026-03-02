@@ -5,18 +5,66 @@
 #include <QFileInfo>
 #include <QTimer>
 #include <QStandardPaths>
+#include <QProgressDialog>
+#include <QtConcurrent>
 #include <libssh2.h>
+#include <openssl/provider.h>
+#include <openssl/rand.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#include <execinfo.h>
+#include <sys/resource.h>
+#endif
+
 #include <QFile>
 #include <QTextStream>
+#include <QDateTime>
 
 static QFile *s_logFile = nullptr;
 
-static void winMessageHandler(QtMsgType type, const QMessageLogContext &ctx, const QString &msg)
+#ifndef _WIN32
+// Crash signal handler — logs stack trace to error.log before dying.
+// Uses only async-signal-safe functions (write, backtrace).
+static void crashSignalHandler(int sig)
 {
-    Q_UNUSED(ctx)
+    const char *sigName = "UNKNOWN";
+    if (sig == SIGABRT) sigName = "SIGABRT";
+    else if (sig == SIGSEGV) sigName = "SIGSEGV";
+    else if (sig == SIGBUS) sigName = "SIGBUS";
+
+    // Write to stderr
+    const char prefix[] = "\n*** CRASH: ";
+    write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    write(STDERR_FILENO, sigName, strlen(sigName));
+    write(STDERR_FILENO, " ***\n", 5);
+
+    // Stack trace
+    void *frames[64];
+    int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+
+    // Also write to log file if open
+    if (s_logFile && s_logFile->isOpen()) {
+        int fd = s_logFile->handle();
+        write(fd, prefix, sizeof(prefix) - 1);
+        write(fd, sigName, strlen(sigName));
+        write(fd, " ***\n", 5);
+        backtrace_symbols_fd(frames, count, fd);
+        fsync(fd);
+    }
+
+    // Re-raise with default handler to produce a core dump / crash report
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+
+static void appMessageHandler(QtMsgType type, const QMessageLogContext &ctx, const QString &msg)
+{
     if (!s_logFile)
         return;
     QTextStream out(s_logFile);
@@ -28,10 +76,13 @@ static void winMessageHandler(QtMsgType type, const QMessageLogContext &ctx, con
     case QtCriticalMsg: label = "CRIT"; break;
     case QtFatalMsg:    label = "FATAL"; break;
     }
-    out << label << ": " << msg << "\n";
+    QString timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    QString category = (ctx.category && ctx.category[0] && qstrcmp(ctx.category, "default") != 0)
+                            ? QStringLiteral(" [%1]").arg(QString::fromUtf8(ctx.category))
+                            : QString();
+    out << timestamp << " " << label << category << ": " << msg << "\n";
     out.flush();
 }
-#endif
 
 #include "app/Application.h"
 #include "core/config/ConfigManager.h"
@@ -183,6 +234,23 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+#else
+    // Raise file descriptor limit.  macOS defaults to 256 soft limit, but
+    // FreeRDP's WinPR uses pipe() for every event (2 FDs each, no eventfd on
+    // macOS).  Thread pools, channels, and H264 codec decode threads easily
+    // exhaust 256 FDs — raise to the hard limit (typically 10240+).
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+
+    // Install crash signal handlers for diagnostics
+    signal(SIGABRT, crashSignalHandler);
+    signal(SIGSEGV, crashSignalHandler);
+    signal(SIGBUS, crashSignalHandler);
 #endif
 
     // Use exact DPI scale factor (e.g. 1.25x, 1.5x) instead of rounding to
@@ -193,6 +261,24 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
 
+    // Load OpenSSL 3 legacy provider (RC4, MD4) — required for RDP licensing
+    // and NTLM authentication.  Must happen before any FreeRDP/OpenSSL calls.
+    // Point OPENSSL_MODULES at the directory containing the legacy provider:
+    //   macOS:   <app>/Contents/Frameworks/legacy.dylib
+    //   Windows: <exe dir>/legacy.dll
+    {
+        QString exeDir = QCoreApplication::applicationDirPath();
+#ifdef Q_OS_MACOS
+        QString modulesDir = exeDir + QStringLiteral("/../Frameworks");
+#else
+        QString modulesDir = exeDir;
+#endif
+        qputenv("OPENSSL_MODULES", modulesDir.toUtf8());
+        OSSL_PROVIDER_load(nullptr, "default");
+        if (!OSSL_PROVIDER_load(nullptr, "legacy"))
+            qWarning("Failed to load OpenSSL legacy provider from %s", qPrintable(modulesDir));
+    }
+
     // Ensure antialiased font rendering on all platforms
     {
         QFont f = app.font();
@@ -200,12 +286,6 @@ int main(int argc, char *argv[])
         app.setFont(f);
     }
 
-#ifdef _WIN32
-    // Log qDebug/qWarning to a file since Windows GUI apps have no console
-    s_logFile = new QFile(QStringLiteral("C:/remotedesktop/debug.log"));
-    if (s_logFile->open(QIODevice::WriteOnly | QIODevice::Truncate))
-        qInstallMessageHandler(winMessageHandler);
-#endif
     app.setApplicationName(QStringLiteral("Remote Desktop Manager"));
     app.setOrganizationName(QStringLiteral("RemoteDesktop"));
 
@@ -219,6 +299,19 @@ int main(int argc, char *argv[])
 
     auto *appInstance = Application::instance();
     QString configDir = appInstance->configDir();
+
+    // Install cross-platform log handler → ~/.remotedesktop/error.log
+    {
+        QString logPath = configDir + QStringLiteral("/error.log");
+        s_logFile = new QFile(logPath);
+
+        // Cap at ~2 MB: truncate if oversized before opening in append mode
+        if (s_logFile->exists() && s_logFile->size() > 2 * 1024 * 1024)
+            s_logFile->resize(0);
+
+        if (s_logFile->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+            qInstallMessageHandler(appMessageHandler);
+    }
 
     // Step 1: Parse CLI overrides early (applied inside init())
     // Step 2: Check if config.ini exists
@@ -340,13 +433,40 @@ int main(int argc, char *argv[])
     }
 
     // Master password handling (vault uses user DB)
+    // PBKDF2 with 600k iterations takes 0.5-2s — run only the CPU work off-thread.
+    // DB reads/writes and signal emission stay on the main thread.
     auto *vault = appInstance->vault();
     if (vault->hasBeenSetup()) {
         MasterPasswordDialog dlg(MasterPasswordDialog::Unlock);
         if (dlg.exec() != QDialog::Accepted) {
             return 0;
         }
-        if (!vault->unlock(dlg.password())) {
+        QString pw = dlg.password();
+
+        // Read salt from DB on main thread
+        QByteArray salt = vault->readSalt();
+        if (salt.isEmpty()) {
+            QMessageBox::critical(nullptr, QStringLiteral("Error"),
+                                  QStringLiteral("Vault salt not found."));
+            return 1;
+        }
+
+        // Run PBKDF2 on thread pool (pure CPU, no DB access)
+        QProgressDialog progress(QStringLiteral("Unlocking vault\u2026"), QString(), 0, 0);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setMinimumDuration(0);
+        progress.setCancelButton(nullptr);
+
+        QFutureWatcher<QByteArray> watcher;
+        QObject::connect(&watcher, &QFutureWatcher<QByteArray>::finished,
+                         &progress, &QProgressDialog::close);
+        watcher.setFuture(QtConcurrent::run([pw, salt]() {
+            return CredentialVault::pbkdf2Derive(pw, salt);
+        }));
+        progress.exec();
+
+        // Verify on main thread (reads check value from DB, decrypts, emits signal)
+        if (!vault->completeUnlock(watcher.result())) {
             QMessageBox::critical(nullptr, QStringLiteral("Error"),
                                   QStringLiteral("Incorrect master password."));
             return 1;
@@ -356,7 +476,33 @@ int main(int argc, char *argv[])
         if (dlg.exec() != QDialog::Accepted) {
             return 0;
         }
-        if (!vault->setupMasterPassword(dlg.password())) {
+        QString pw = dlg.password();
+
+        // Generate salt and store on main thread
+        QByteArray salt(16, 0);
+        if (RAND_bytes(reinterpret_cast<unsigned char *>(salt.data()), 16) != 1) {
+            QMessageBox::critical(nullptr, QStringLiteral("Error"),
+                                  QStringLiteral("Failed to generate random salt."));
+            return 1;
+        }
+        appInstance->userDatabase()->setMetadataValue(QStringLiteral("vault_salt"), salt);
+
+        // Run PBKDF2 on thread pool (pure CPU, no DB access)
+        QProgressDialog progress(QStringLiteral("Setting up vault\u2026"), QString(), 0, 0);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setMinimumDuration(0);
+        progress.setCancelButton(nullptr);
+
+        QFutureWatcher<QByteArray> watcher;
+        QObject::connect(&watcher, &QFutureWatcher<QByteArray>::finished,
+                         &progress, &QProgressDialog::close);
+        watcher.setFuture(QtConcurrent::run([pw, salt]() {
+            return CredentialVault::pbkdf2Derive(pw, salt);
+        }));
+        progress.exec();
+
+        // Complete setup on main thread (encrypts check value, stores in DB, emits signal)
+        if (!vault->completeSetup(watcher.result())) {
             QMessageBox::critical(nullptr, QStringLiteral("Error"),
                                   QStringLiteral("Failed to set up credential vault."));
             return 1;
@@ -450,6 +596,16 @@ int main(int argc, char *argv[])
                      &mainWindow, [&](const QModelIndex &parentIndex) {
         if (!admin)
             return;
+
+        // Save parent folder ID before dialog — index may become stale
+        // if the model reloads (e.g. 30s poll timer) while dialog is open.
+        qint64 parentFolderId = -1;
+        if (parentIndex.isValid()) {
+            auto *parentItem = treeModel->itemFromIndex(parentIndex);
+            if (parentItem && parentItem->nodeType() == TreeNodeType::Folder)
+                parentFolderId = parentItem->folder().id;
+        }
+
         FolderDialog dlg(&mainWindow);
         dlg.setWindowTitle(QStringLiteral("Add Folder"));
         if (dlg.exec() != QDialog::Accepted)
@@ -459,22 +615,15 @@ int main(int argc, char *argv[])
         if (folder.name.isEmpty())
             return;
 
-        if (parentIndex.isValid()) {
-            auto *parentItem = treeModel->itemFromIndex(parentIndex);
-            if (parentItem && parentItem->nodeType() == TreeNodeType::Folder) {
-                folder.parentId = parentItem->folder().id;
-            }
-        }
-
+        folder.parentId = parentFolderId;
         folder.id = db->insertFolder(folder);
         if (folder.id > 0) {
-            // Write folder credential defaults to user DB
             if (folder.defaultRdpCredentialId > 0 || folder.defaultSshCredentialId > 0) {
                 userDb->setFolderDefaults(folder.id,
                                            folder.defaultRdpCredentialId,
                                            folder.defaultSshCredentialId);
             }
-            treeModel->addFolder(folder, parentIndex);
+            mainWindow.refreshTree();
         }
     });
 
@@ -482,6 +631,15 @@ int main(int argc, char *argv[])
                      &mainWindow, [&](const QModelIndex &parentIndex) {
         if (!admin)
             return;
+
+        // Save parent folder ID before dialog — index may become stale
+        qint64 parentFolderId = -1;
+        if (parentIndex.isValid()) {
+            auto *parentItem = treeModel->itemFromIndex(parentIndex);
+            if (parentItem && parentItem->nodeType() == TreeNodeType::Folder)
+                parentFolderId = parentItem->folder().id;
+        }
+
         ConnectionDialog dlg(&mainWindow);
         dlg.setWindowTitle(QStringLiteral("Add Connection"));
         if (dlg.exec() != QDialog::Accepted)
@@ -491,23 +649,16 @@ int main(int argc, char *argv[])
         if (entry.name.isEmpty() || entry.hostname.isEmpty())
             return;
 
-        if (parentIndex.isValid()) {
-            auto *parentItem = treeModel->itemFromIndex(parentIndex);
-            if (parentItem && parentItem->nodeType() == TreeNodeType::Folder) {
-                entry.folderId = parentItem->folder().id;
-            }
-        }
+        entry.folderId = parentFolderId;
 
         qint64 credentialId = entry.credentialId;
         entry.credentialId = -1; // shared DB has no credential_id
 
         entry.id = db->insertConnection(entry);
         if (entry.id > 0) {
-            // Write credential assignment to user DB
             if (credentialId > 0)
                 userDb->setCredentialAssignment(entry.id, credentialId);
-            entry.credentialId = credentialId; // restore for tree display
-            treeModel->addConnection(entry, parentIndex);
+            mainWindow.refreshTree();
         }
     });
 
@@ -518,23 +669,26 @@ int main(int argc, char *argv[])
             return;
 
         if (item->nodeType() == TreeNodeType::Folder) {
+            // Save IDs before dialog — index may become stale
+            qint64 folderId = item->folder().id;
+            qint64 parentId = item->folder().parentId;
+            ConnectionFolder folderSnapshot = item->folder();
+
             FolderDialog dlg(&mainWindow);
             dlg.setWindowTitle(QStringLiteral("Edit Folder"));
-            dlg.setFolder(item->folder());
+            dlg.setFolder(folderSnapshot);
             if (!admin)
                 dlg.setReadOnlyName(true);
             if (dlg.exec() != QDialog::Accepted)
                 return;
 
             ConnectionFolder folder = dlg.folder();
-            folder.id = item->folder().id;
-            folder.parentId = item->folder().parentId;
+            folder.id = folderId;
+            folder.parentId = parentId;
 
-            // Admin updates shared fields
             if (admin)
                 db->updateFolder(folder);
 
-            // Everyone updates their own folder defaults in user DB
             userDb->setFolderDefaults(folder.id,
                                        folder.defaultRdpCredentialId,
                                        folder.defaultSshCredentialId);
@@ -544,40 +698,39 @@ int main(int argc, char *argv[])
                                               folder.defaultRdpCredentialId,
                                               folder.defaultSshCredentialId,
                                               db);
-                treeModel->loadFromDatabase();
-            } else {
-                item->folder() = folder;
-                emit treeModel->dataChanged(index, index);
             }
+            mainWindow.refreshTree();
 
         } else {
+            // Save IDs before dialog — index may become stale
+            qint64 connId = item->connection().id;
+            qint64 folderId = item->connection().folderId;
+            ConnectionEntry connSnapshot = item->connection();
+
             ConnectionDialog dlg(&mainWindow);
             dlg.setWindowTitle(QStringLiteral("Edit Connection"));
-            dlg.setConnection(item->connection());
+            dlg.setConnection(connSnapshot);
             if (!admin)
                 dlg.setReadOnlySharedFields(true);
             if (dlg.exec() != QDialog::Accepted)
                 return;
 
             ConnectionEntry entry = dlg.connection();
-            entry.id = item->connection().id;
-            entry.folderId = item->connection().folderId;
+            entry.id = connId;
+            entry.folderId = folderId;
 
-            // Admin updates shared fields
             if (admin) {
                 ConnectionEntry sharedEntry = entry;
-                sharedEntry.credentialId = -1; // shared DB has no credential_id
+                sharedEntry.credentialId = -1;
                 db->updateConnection(sharedEntry);
             }
 
-            // Everyone updates their own credential assignment in user DB
             if (entry.credentialId > 0)
                 userDb->setCredentialAssignment(entry.id, entry.credentialId);
             else
                 userDb->removeCredentialAssignment(entry.id);
 
-            item->connection() = entry;
-            emit treeModel->dataChanged(index, index);
+            mainWindow.refreshTree();
         }
     });
 
@@ -589,26 +742,36 @@ int main(int argc, char *argv[])
         if (!item)
             return;
 
-        QString typeStr = item->nodeType() == TreeNodeType::Folder
+        // Save IDs before message box — index may become stale
+        TreeNodeType nodeType = item->nodeType();
+        qint64 itemId = item->itemId();
+        QString itemName = item->name();
+        QString typeStr = nodeType == TreeNodeType::Folder
             ? QStringLiteral("folder") : QStringLiteral("connection");
 
         auto result = QMessageBox::question(&mainWindow, QStringLiteral("Delete"),
-            QStringLiteral("Delete %1 \"%2\"?").arg(typeStr, item->name()));
+            QStringLiteral("Delete %1 \"%2\"?").arg(typeStr, itemName));
         if (result != QMessageBox::Yes)
             return;
 
-        if (item->nodeType() == TreeNodeType::Folder) {
-            db->deleteFolder(item->folder().id);
+        if (nodeType == TreeNodeType::Folder) {
+            db->deleteFolder(itemId);
         } else {
-            auto *widget = tabWidget->sessionForConnection(item->connection().id);
+            // Disconnect if session is active
+            auto *widget = tabWidget->sessionForConnection(itemId);
             if (widget) {
-                disconnectSession(&mainWindow, index);
+                widget->disconnect();
+                if (auto *rdp = qobject_cast<RdpSessionWidget *>(widget))
+                    rdp->disconnectSession();
+                else if (auto *ssh = qobject_cast<SshSessionWidget *>(widget))
+                    ssh->disconnectSession();
+                tabWidget->removeSessionTab(itemId);
             }
-            qint64 connId = item->connection().id;
-            db->deleteConnection(connId);
-            userDb->removeCredentialAssignment(connId);
+            db->deleteConnection(itemId);
+            userDb->removeCredentialAssignment(itemId);
         }
-        treeModel->removeItem(index);
+        mainWindow.refreshTree();
+        mainWindow.updateStatusBar();
     });
 
     // Tab close -> disconnect
@@ -616,11 +779,18 @@ int main(int argc, char *argv[])
                      &mainWindow, [&](qint64 connectionId) {
         auto *widget = tabWidget->sessionForConnection(connectionId);
         if (widget)
-            widget->disconnect();
+            widget->disconnect();  // Detach all Qt signals before tearing down
         if (auto *rdp = qobject_cast<RdpSessionWidget *>(widget)) {
             rdp->disconnectSession();
         } else if (auto *ssh = qobject_cast<SshSessionWidget *>(widget)) {
             ssh->disconnectSession();
+        }
+        // Update tree icon to disconnected
+        auto *mdl = mainWindow.treeModel();
+        auto *item = mdl->findItemById(TreeNodeType::Connection, connectionId);
+        if (item) {
+            QModelIndex idx = mdl->indexFromItem(item);
+            mdl->setConnectionState(idx, ConnectionState::Disconnected);
         }
         tabWidget->removeSessionTab(connectionId);
         mainWindow.updateStatusBar();

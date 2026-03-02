@@ -77,6 +77,16 @@ ConnectionDialog::ConnectionDialog(QWidget *parent)
     m_winKeyCopyPasteCheck->setChecked(true);
     rdpLayout->addWidget(m_winKeyCopyPasteCheck);
 
+    auto *securityRow = new QHBoxLayout;
+    securityRow->addWidget(new QLabel(QStringLiteral("Security:")));
+    m_securityCombo = new QComboBox;
+    m_securityCombo->addItem(QStringLiteral("Auto (Negotiate)"), static_cast<int>(RdpSecurity::Auto));
+    m_securityCombo->addItem(QStringLiteral("NLA (CredSSP)"), static_cast<int>(RdpSecurity::NLA));
+    m_securityCombo->addItem(QStringLiteral("TLS"), static_cast<int>(RdpSecurity::TLS));
+    m_securityCombo->addItem(QStringLiteral("RDP"), static_cast<int>(RdpSecurity::RDP));
+    securityRow->addWidget(m_securityCombo);
+    rdpLayout->addLayout(securityRow);
+
     layout->addWidget(m_rdpOptionsGroup);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -106,6 +116,10 @@ void ConnectionDialog::setConnection(const ConnectionEntry &entry)
     m_winKeyPassthroughCheck->setChecked(entry.winKeyPassthrough);
     m_winKeyCopyPasteCheck->setChecked(entry.winKeyCopyPaste);
 
+    int secIdx = m_securityCombo->findData(static_cast<int>(entry.securityMode));
+    if (secIdx >= 0)
+        m_securityCombo->setCurrentIndex(secIdx);
+
     bool isRdp = entry.protocol == Protocol::RDP;
     m_colorDepthCombo->setVisible(isRdp);
     m_colorDepthLabel->setVisible(isRdp);
@@ -125,6 +139,7 @@ ConnectionEntry ConnectionDialog::connection() const
     e.enableCompression = m_compressionCheck->isChecked();
     e.winKeyPassthrough = m_winKeyPassthroughCheck->isChecked();
     e.winKeyCopyPaste = m_winKeyCopyPasteCheck->isChecked();
+    e.securityMode = static_cast<RdpSecurity>(m_securityCombo->currentData().toInt());
     return e;
 }
 

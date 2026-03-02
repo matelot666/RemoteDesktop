@@ -84,6 +84,74 @@ void CredentialVault::lock()
     emit lockedChanged(true);
 }
 
+QByteArray CredentialVault::readSalt() const
+{
+    return m_db->metadataValue(SALT_KEY);
+}
+
+QByteArray CredentialVault::pbkdf2Derive(const QString &password, const QByteArray &salt)
+{
+    QByteArray key(KEY_LENGTH, 0);
+    QByteArray passUtf8 = password.toUtf8();
+
+    int result = PKCS5_PBKDF2_HMAC(
+        passUtf8.constData(), passUtf8.size(),
+        reinterpret_cast<const unsigned char *>(salt.constData()), salt.size(),
+        PBKDF2_ITERATIONS,
+        EVP_sha256(),
+        KEY_LENGTH,
+        reinterpret_cast<unsigned char *>(key.data()));
+
+    if (result != 1) {
+        qWarning() << "PBKDF2 key derivation failed";
+        return {};
+    }
+    return key;
+}
+
+bool CredentialVault::completeUnlock(const QByteArray &derivedKey)
+{
+    if (derivedKey.isEmpty())
+        return false;
+
+    m_derivedKey = derivedKey;
+
+    QByteArray checkCiphertext = m_db->metadataValue(CHECK_KEY);
+    if (checkCiphertext.isEmpty()) {
+        m_derivedKey.clear();
+        return false;
+    }
+
+    QString decrypted = decrypt(checkCiphertext);
+    if (decrypted != CHECK_PLAINTEXT) {
+        m_derivedKey.clear();
+        return false;
+    }
+
+    m_unlocked = true;
+    emit lockedChanged(false);
+    return true;
+}
+
+bool CredentialVault::completeSetup(const QByteArray &derivedKey)
+{
+    if (derivedKey.isEmpty())
+        return false;
+
+    m_derivedKey = derivedKey;
+
+    QByteArray checkValue = encrypt(CHECK_PLAINTEXT);
+    if (checkValue.isEmpty()) {
+        m_derivedKey.clear();
+        return false;
+    }
+
+    m_db->setMetadataValue(CHECK_KEY, checkValue);
+    m_unlocked = true;
+    emit lockedChanged(false);
+    return true;
+}
+
 bool CredentialVault::deriveKey(const QString &password, const QByteArray &salt)
 {
     m_derivedKey.resize(KEY_LENGTH);

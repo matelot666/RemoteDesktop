@@ -14,7 +14,7 @@ elseif(WIN32)
     #   cmake -DCMAKE_PREFIX_PATH=C:/Qt/6.10.2/msvc2022_64 ..
     # or via environment variable QT_DIR
 endif()
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Sql)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Sql Concurrent Svg)
 
 # ── FreeRDP 3 ─────────────────────────────────────────────────────────
 if(APPLE)
@@ -92,6 +92,8 @@ set(SOURCES
     src/ui/dialogs/MasterPasswordDialog.cpp
     src/ui/dialogs/CredentialDialog.cpp
     src/ui/dialogs/CredentialManagerDialog.cpp
+    src/ui/dialogs/SessionInfoDialog.cpp
+    src/ui/dialogs/QuickConnectDialog.cpp
     src/ui/dialogs/SetupDialog.cpp
 )
 
@@ -126,6 +128,8 @@ set(HEADERS
     src/ui/dialogs/MasterPasswordDialog.h
     src/ui/dialogs/CredentialDialog.h
     src/ui/dialogs/CredentialManagerDialog.h
+    src/ui/dialogs/SessionInfoDialog.h
+    src/ui/dialogs/QuickConnectDialog.h
     src/ui/dialogs/SetupDialog.h
 )
 
@@ -183,6 +187,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Gui
     Qt6::Widgets
     Qt6::Sql
+    Qt6::Concurrent
+    Qt6::Svg
     freerdp
     freerdp-client
     winpr
